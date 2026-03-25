@@ -171,12 +171,11 @@ pub fn run() {
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            // Updater disabled until signing keys are configured
-            // #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            // {
-            //     app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
-            //     app.handle().plugin(tauri_plugin_process::init())?;
-            // }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+                app.handle().plugin(tauri_plugin_process::init())?;
+            }
 
             // Build tray icon
             let open_i = MenuItem::with_id(app, "open", "Open Workspace", true, None::<&str>)?;
