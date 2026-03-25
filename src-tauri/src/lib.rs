@@ -209,8 +209,9 @@ pub fn run() {
                         "pause" => {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
-                                let state: State<'_, AppState> = handle.state();
-                                if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+                                let app_state = handle.state::<AppState>();
+                                let guard = app_state.sync_engine.lock().await;
+                                if let Some(engine) = guard.as_ref() {
                                     engine.pause().await;
                                 }
                             });
@@ -234,8 +235,8 @@ pub fn run() {
                 }
 
                 // Store engine in state
-                let state: State<'_, AppState> = handle.state();
-                *state.sync_engine.lock().await = Some(Arc::clone(&engine));
+                let app_state = handle.state::<AppState>();
+                *app_state.sync_engine.lock().await = Some(Arc::clone(&engine));
 
                 // Start the sync loop
                 engine.start().await;

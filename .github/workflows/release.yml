@@ -46,13 +46,15 @@ jobs:
           VERSION="${GITHUB_REF#refs/tags/v}"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           cd src-tauri
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            powershell -Command "(Get-Content tauri.conf.json) -replace '\"version\": \".*\"', '\"version\": \"'$VERSION'\"' | Set-Content tauri.conf.json"
-            powershell -Command "(Get-Content Cargo.toml) -replace 'version = \".*\"', 'version = \"'$VERSION'\"' | Set-Content Cargo.toml"
-          else
-            sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" tauri.conf.json
-            sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
-          fi
+          node -e "
+            const fs = require('fs');
+            let conf = fs.readFileSync('tauri.conf.json','utf8');
+            conf = conf.replace(/\"version\": \"[^\"]*\"/, '\"version\": \"'+'$VERSION'+'\"');
+            fs.writeFileSync('tauri.conf.json', conf);
+            let cargo = fs.readFileSync('Cargo.toml','utf8');
+            cargo = cargo.replace(/^version = \"[^\"]*\"/m, 'version = \"'+'$VERSION'+'\"');
+            fs.writeFileSync('Cargo.toml', cargo);
+          "
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
