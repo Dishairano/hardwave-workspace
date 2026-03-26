@@ -14,6 +14,7 @@ use tokio::sync::Mutex as TokioMutex;
 pub struct AppState {
     pub api_token: std::sync::Mutex<Option<String>>,
     pub sync_engine: TokioMutex<Option<Arc<sync::SyncEngine>>>,
+    pub auto_sync: std::sync::Mutex<bool>,
 }
 
 /// Shared auth token path — same as VSTs and Suite.
@@ -194,6 +195,63 @@ async fn download_file(
     Ok(save_path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
+    *state.auto_sync.lock().unwrap() = enabled;
+    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+        if enabled {
+            engine.resume().await;
+        } else {
+            engine.pause().await;
+        }
+    }
+    // Persist preference
+    if let Some(dir) = dirs::data_dir() {
+        let pref_path = dir.join("hardwave").join("auto_sync");
+        let _ = std::fs::create_dir_all(pref_path.parent().unwrap());
+        let _ = std::fs::write(&pref_path, if enabled { "1" } else { "0" });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_auto_sync(state: State<'_, AppState>) -> bool {
+    *state.auto_sync.lock().unwrap()
+}
+
+fn load_auto_sync_pref() -> bool {
+    dirs::data_dir()
+        .map(|d| d.join("hardwave").join("auto_sync"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() != "0")
+        .unwrap_or(true) // default: enabled
+}
+
+// ─── Token Bridge ─────────────────────────────────────────────────────────
+// Periodically read hw_session cookie from webview and pass to sync engine.
+
+async fn start_token_bridge(handle: tauri::AppHandle) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if let Some(win) = handle.get_webview_window("main") {
+            // Inject JS that reads the cookie and calls set_token
+            let js = r#"
+                (function() {
+                    var m = document.cookie.match(/(?:^|;\s*)hw_session=([^;]+)/);
+                    if (m && m[1] && window.__TAURI_INTERNALS__) {
+                        var current = window.__HW_SYNCED_TOKEN__;
+                        if (current !== m[1]) {
+                            window.__HW_SYNCED_TOKEN__ = m[1];
+                            window.__TAURI_INTERNALS__.invoke('set_token', { token: m[1] });
+                        }
+                    }
+                })();
+            "#;
+            let _ = win.eval(js);
+        }
+    }
+}
+
 // ─── Update Check ─────────────────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -317,19 +375,32 @@ pub fn run() {
             // Check for updates
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // Wait a few seconds for the app to settle
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 check_for_updates(update_handle).await;
             });
 
+            // Start token bridge — reads hw_session cookie from webview
+            let bridge_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for webview to load
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                start_token_bridge(bridge_handle).await;
+            });
+
             // Initialize sync engine
             let handle = app.handle().clone();
+            let auto_sync_enabled = load_auto_sync_pref();
             tauri::async_runtime::spawn(async move {
                 let engine = Arc::new(sync::SyncEngine::new(handle.clone()));
 
                 // Load existing auth token
                 if let Some(token) = load_saved_token() {
                     engine.set_token(Some(token)).await;
+                }
+
+                // If auto-sync is disabled, start paused
+                if !auto_sync_enabled {
+                    engine.pause().await;
                 }
 
                 // Store engine in state
@@ -345,6 +416,7 @@ pub fn run() {
         .manage(AppState {
             api_token: std::sync::Mutex::new(load_saved_token()),
             sync_engine: TokioMutex::new(None),
+            auto_sync: std::sync::Mutex::new(load_auto_sync_pref()),
         })
         .invoke_handler(tauri::generate_handler![
             login,
@@ -358,6 +430,8 @@ pub fn run() {
             open_sync_folder,
             download_file,
             install_update,
+            toggle_auto_sync,
+            get_auto_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hardwave Workspace");

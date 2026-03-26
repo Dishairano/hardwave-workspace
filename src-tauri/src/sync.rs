@@ -157,6 +157,20 @@ impl SyncEngine {
         }
     }
 
+    /// Emit a conflict warning to the webview.
+    fn emit_conflict(&self, rel_path: &str, local_size: u64, remote_size: u64) {
+        if let Some(win) = self.app.get_webview_window("main") {
+            let escaped = rel_path.replace('\\', "\\\\").replace('\'', "\\'");
+            let js = format!(
+                "window.__HW_SYNC_CONFLICTS__ = window.__HW_SYNC_CONFLICTS__ || []; \
+                 window.__HW_SYNC_CONFLICTS__.push({{ rel_path: '{}', local_size: {}, remote_size: {}, time: Date.now() }});",
+                escaped, local_size, remote_size
+            );
+            let _ = win.eval(&js);
+        }
+        eprintln!("[Sync] CONFLICT: '{}' exists locally ({} bytes) but differs from remote ({} bytes)", rel_path, local_size, remote_size);
+    }
+
     /// Start the sync loop. Call this once on app startup.
     pub async fn start(self: Arc<Self>) {
         let root = sync_root();
@@ -354,8 +368,31 @@ impl SyncEngine {
                 };
 
                 if needs_download {
-                    eprintln!("[Sync] Downloading: {}", rel_path);
                     let local_path = root.join(&rel_path);
+
+                    // Conflict detection: file exists locally but not in our index
+                    if local_path.exists() && !index.contains_key(&rel_path) {
+                        let local_size = local_path.metadata().map(|m| m.len()).unwrap_or(0);
+                        let local_hash = hash_file(&local_path).unwrap_or_default();
+                        // If local hash matches remote, just index it — no download needed
+                        if rf.sha256.as_deref() == Some(&local_hash) {
+                            eprintln!("[Sync] Already exists (same hash): {}", rel_path);
+                            index.insert(rel_path.clone(), SyncEntry {
+                                rel_path: rel_path.clone(),
+                                sha256: local_hash,
+                                modified: chrono::Utc::now().to_rfc3339(),
+                                size: local_size,
+                                remote_id: Some(rf.id.clone()),
+                                workspace_id: Some(ws.id.clone()),
+                            });
+                            continue;
+                        }
+                        // Different content — emit conflict warning, skip this file
+                        self.emit_conflict(&rel_path, local_size, rf.size);
+                        continue;
+                    }
+
+                    eprintln!("[Sync] Downloading: {}", rel_path);
                     if let Some(parent) = local_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
