@@ -95,7 +95,7 @@ pub async fn list_workspaces(token: &str) -> Result<Vec<Workspace>, String> {
 pub async fn list_files(token: &str, workspace_id: &str) -> Result<Vec<WorkspaceFile>, String> {
     let client = reqwest::Client::new();
     let res = client
-        .get(format!("{}/workspaces/{}/files", WS_BASE, workspace_id))
+        .get(format!("{}/workspaces/{}/files?all=true", WS_BASE, workspace_id))
         .bearer_auth(token)
         .send()
         .await
@@ -135,6 +135,7 @@ pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) ->
 
     let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
     data.get("url")
+        .or(data.get("downloadUrl"))
         .and_then(|u| u.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| "No download URL in response".into())
@@ -143,7 +144,9 @@ pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) ->
 /// Initiate a file upload (get presigned upload URL).
 #[derive(Debug, Deserialize)]
 pub struct UploadInitResponse {
+    #[serde(alias = "uploadUrl")]
     pub upload_url: String,
+    #[serde(alias = "fileId")]
     pub file_id: String,
 }
 
