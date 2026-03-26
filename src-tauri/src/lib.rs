@@ -217,12 +217,17 @@ async fn check_for_updates(handle: tauri::AppHandle) {
         }
     };
 
-    // Emit event to frontend so it can show an in-app modal
-    let _ = handle.emit("update-available", serde_json::json!({
-        "version": update.version,
-        "body": update.body.clone().unwrap_or_default(),
-        "currentVersion": env!("CARGO_PKG_VERSION"),
-    }));
+    // Set window variable so the frontend modal picks it up
+    let version = update.version.clone();
+    let body = update.body.clone().unwrap_or_default().replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
+    let current = env!("CARGO_PKG_VERSION");
+    if let Some(win) = handle.get_webview_window("main") {
+        let js = format!(
+            "window.__HW_UPDATE__ = {{ version: '{}', body: '{}', currentVersion: '{}' }};",
+            version, body, current
+        );
+        let _ = win.eval(&js);
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -238,7 +243,9 @@ async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
     update.download_and_install(
         move |downloaded, total| {
             let pct = total.map(|t| (downloaded as f64 / t as f64 * 100.0) as u32).unwrap_or(0);
-            let _ = h.emit("update-progress", serde_json::json!({ "percent": pct }));
+            if let Some(win) = h.get_webview_window("main") {
+                let _ = win.eval(&format!("window.__HW_UPDATE_PROGRESS__ = {};", pct));
+            }
         },
         || {},
     ).await.map_err(|e| format!("Install failed: {}", e))?;
