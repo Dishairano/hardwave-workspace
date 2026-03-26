@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 /// How often to poll the remote for changes (seconds).
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -145,6 +145,18 @@ impl SyncEngine {
         let _ = self.app.emit("sync:status", status.clone());
     }
 
+    /// Push per-file sync progress to the webview via eval().
+    fn emit_file_progress(&self, rel_path: &str, direction: &str, percent: u32) {
+        if let Some(win) = self.app.get_webview_window("main") {
+            let escaped = rel_path.replace('\\', "\\\\").replace('\'', "\\'");
+            let js = format!(
+                "window.__HW_SYNC_FILE__ = {{ rel_path: '{}', direction: '{}', percent: {} }};",
+                escaped, direction, percent
+            );
+            let _ = win.eval(&js);
+        }
+    }
+
     /// Start the sync loop. Call this once on app startup.
     pub async fn start(self: Arc<Self>) {
         let root = sync_root();
@@ -265,32 +277,19 @@ impl SyncEngine {
             .filter(|s| !s.is_empty());
 
         self.update_status("syncing", None).await;
-
-        let _ = self.app.emit("sync:file", SyncFileProgress {
-            rel_path: rel_path.to_string(),
-            direction: "upload".into(),
-            percent: 0,
-            bytes_done: 0,
-            bytes_total: meta.len(),
-        });
+        self.emit_file_progress(rel_path, "upload", 0);
 
         // Initiate upload
         let upload = api::init_upload(&token, &ws_id, filename, meta.len(), folder, &sha).await?;
 
         // Read file and upload to S3
         let data = std::fs::read(&full_path).map_err(|e| e.to_string())?;
+        self.emit_file_progress(rel_path, "upload", 50);
         api::upload_to_s3(&upload.upload_url, data).await?;
 
         // Confirm upload
         api::register_upload(&token, &ws_id, &upload.file_id).await?;
-
-        let _ = self.app.emit("sync:file", SyncFileProgress {
-            rel_path: rel_path.to_string(),
-            direction: "upload".into(),
-            percent: 100,
-            bytes_done: meta.len(),
-            bytes_total: meta.len(),
-        });
+        self.emit_file_progress(rel_path, "upload", 100);
 
         // Update index
         index.insert(rel_path.to_string(), SyncEntry {
@@ -364,13 +363,7 @@ impl SyncEngine {
                     // Download
                     match api::get_download_url(&token, &ws.id, &rf.id).await {
                         Ok(url) => {
-                            let _ = self.app.emit("sync:file", SyncFileProgress {
-                                rel_path: rel_path.clone(),
-                                direction: "download".into(),
-                                percent: 0,
-                                bytes_done: 0,
-                                bytes_total: rf.size,
-                            });
+                            self.emit_file_progress(&rel_path, "download", 0);
 
                             let client = reqwest::Client::new();
                             if let Ok(res) = client.get(&url).send().await {
@@ -391,13 +384,7 @@ impl SyncEngine {
                                         workspace_id: Some(ws.id.clone()),
                                     });
 
-                                    let _ = self.app.emit("sync:file", SyncFileProgress {
-                                        rel_path: rel_path.clone(),
-                                        direction: "download".into(),
-                                        percent: 100,
-                                        bytes_done: rf.size,
-                                        bytes_total: rf.size,
-                                    });
+                                    self.emit_file_progress(&rel_path, "download", 100);
                                 }
                             }
                         }
