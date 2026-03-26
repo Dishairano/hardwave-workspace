@@ -121,7 +121,23 @@ impl SyncEngine {
     }
 
     pub async fn set_token(&self, token: Option<String>) {
-        *self.token.write().await = token;
+        let is_new = token.is_some();
+        *self.token.write().await = token.clone();
+
+        // As soon as we get a token, create workspace folders immediately
+        if is_new {
+            if let Some(t) = token {
+                let root = sync_root();
+                let _ = std::fs::create_dir_all(&root);
+                if let Ok(workspaces) = api::list_workspaces(&t).await {
+                    for ws in &workspaces {
+                        let ws_dir = root.join(&ws.name);
+                        let _ = std::fs::create_dir_all(&ws_dir);
+                        eprintln!("[Sync] Created folder: {}", ws_dir.display());
+                    }
+                }
+            }
+        }
     }
 
     pub async fn pause(&self) {
