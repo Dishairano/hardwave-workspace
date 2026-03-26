@@ -198,7 +198,6 @@ async fn download_file(
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 async fn check_for_updates(handle: tauri::AppHandle) {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     use tauri_plugin_updater::UpdaterExt;
 
     let updater = match handle.updater() {
@@ -218,50 +217,31 @@ async fn check_for_updates(handle: tauri::AppHandle) {
         }
     };
 
-    let version = update.version.clone();
-    let body = update.body.clone().unwrap_or_default();
+    // Emit event to frontend so it can show an in-app modal
+    let _ = handle.emit("update-available", serde_json::json!({
+        "version": update.version,
+        "body": update.body.clone().unwrap_or_default(),
+        "currentVersion": env!("CARGO_PKG_VERSION"),
+    }));
+}
 
-    let msg = if body.is_empty() {
-        format!("A new version ({}) is available. Would you like to update now?", version)
-    } else {
-        format!(
-            "A new version ({}) is available.\n\n{}\n\nWould you like to update now?",
-            version, body
-        )
-    };
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    handle
-        .dialog()
-        .message(msg)
-        .title("Update Available")
-        .kind(MessageDialogKind::Info)
-        .buttons(MessageDialogButtons::OkCancelCustom("Update".into(), "Later".into()))
-        .show(move |accepted| {
-            let _ = tx.send(accepted);
-        });
+    let updater = handle.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?
+        .ok_or("No update available")?;
 
-    if !rx.await.unwrap_or(false) {
-        return;
-    }
-
-    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
-        eprintln!("[Workspace] Update install failed: {}", e);
-        handle
-            .dialog()
-            .message(format!("Update failed: {}", e))
-            .title("Update Error")
-            .kind(MessageDialogKind::Error)
-            .blocking_show();
-        return;
-    }
-
-    handle
-        .dialog()
-        .message("Update installed. The app will now restart.")
-        .title("Update Complete")
-        .kind(MessageDialogKind::Info)
-        .blocking_show();
+    let h = handle.clone();
+    update.download_and_install(
+        move |downloaded, total| {
+            let pct = total.map(|t| (downloaded as f64 / t as f64 * 100.0) as u32).unwrap_or(0);
+            let _ = h.emit("update-progress", serde_json::json!({ "percent": pct }));
+        },
+        || {},
+    ).await.map_err(|e| format!("Install failed: {}", e))?;
 
     handle.restart();
 }
@@ -370,6 +350,7 @@ pub fn run() {
             get_sync_folder,
             open_sync_folder,
             download_file,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hardwave Workspace");
