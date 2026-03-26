@@ -163,6 +163,78 @@ fn open_sync_folder() -> Result<(), String> {
     Ok(())
 }
 
+// ─── Update Check ─────────────────────────────────────────────────────────
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn check_for_updates(handle: tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = match handle.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[Workspace] Failed to get updater: {}", e);
+            return;
+        }
+    };
+
+    let update = match updater.check().await {
+        Ok(Some(update)) => update,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("[Workspace] Update check failed: {}", e);
+            return;
+        }
+    };
+
+    let version = update.version.clone();
+    let body = update.body.clone().unwrap_or_default();
+
+    let msg = if body.is_empty() {
+        format!("A new version ({}) is available. Would you like to update now?", version)
+    } else {
+        format!(
+            "A new version ({}) is available.\n\n{}\n\nWould you like to update now?",
+            version, body
+        )
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    handle
+        .dialog()
+        .message(msg)
+        .title("Update Available")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom("Update".into(), "Later".into()))
+        .show(move |accepted| {
+            let _ = tx.send(accepted);
+        });
+
+    if !rx.await.unwrap_or(false) {
+        return;
+    }
+
+    if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+        eprintln!("[Workspace] Update install failed: {}", e);
+        handle
+            .dialog()
+            .message(format!("Update failed: {}", e))
+            .title("Update Error")
+            .kind(MessageDialogKind::Error)
+            .blocking_show();
+        return;
+    }
+
+    handle
+        .dialog()
+        .message("Update installed. The app will now restart.")
+        .title("Update Complete")
+        .kind(MessageDialogKind::Info)
+        .blocking_show();
+
+    handle.restart();
+}
+
 // ─── App Entry ─────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -175,6 +247,7 @@ pub fn run() {
             {
                 app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
                 app.handle().plugin(tauri_plugin_process::init())?;
+                app.handle().plugin(tauri_plugin_dialog::init())?;
             }
 
             // Build tray icon
@@ -222,6 +295,14 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // Check for updates
+            let update_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait a few seconds for the app to settle
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                check_for_updates(update_handle).await;
+            });
 
             // Initialize sync engine
             let handle = app.handle().clone();
