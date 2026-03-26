@@ -124,7 +124,7 @@ impl SyncEngine {
         let is_new = token.is_some();
         *self.token.write().await = token.clone();
 
-        // As soon as we get a token, create workspace folders immediately
+        // As soon as we get a token, create workspace + subfolder directories
         if is_new {
             if let Some(t) = token {
                 let root = sync_root();
@@ -133,7 +133,20 @@ impl SyncEngine {
                     for ws in &workspaces {
                         let ws_dir = root.join(&ws.name);
                         let _ = std::fs::create_dir_all(&ws_dir);
-                        eprintln!("[Sync] Created folder: {}", ws_dir.display());
+                        eprintln!("[Sync] Created workspace folder: {}", ws_dir.display());
+                        // Also create all subfolders
+                        if let Ok(folders) = api::list_folders(&t, &ws.id).await {
+                            for f in &folders {
+                                let folder_path = f.path.as_deref()
+                                    .unwrap_or(&f.name)
+                                    .trim_matches('/');
+                                if !folder_path.is_empty() {
+                                    let dir = ws_dir.join(folder_path);
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    eprintln!("[Sync] Created subfolder: {}", dir.display());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -353,6 +366,18 @@ impl SyncEngine {
         for ws in &workspaces {
             let ws_dir = root.join(&ws.name);
             let _ = std::fs::create_dir_all(&ws_dir);
+
+            // Create all subfolders (even empty ones)
+            if let Ok(folders) = api::list_folders(&token, &ws.id).await {
+                for f in &folders {
+                    let folder_path = f.path.as_deref()
+                        .unwrap_or(&f.name)
+                        .trim_matches('/');
+                    if !folder_path.is_empty() {
+                        let _ = std::fs::create_dir_all(ws_dir.join(folder_path));
+                    }
+                }
+            }
 
             let remote_files = match api::list_files(&token, &ws.id).await {
                 Ok(f) => {

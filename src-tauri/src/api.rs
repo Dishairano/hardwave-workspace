@@ -134,6 +134,40 @@ pub async fn list_files(token: &str, workspace_id: &str) -> Result<Vec<Workspace
     Ok(files)
 }
 
+/// A folder in a workspace.
+#[derive(Debug, Deserialize)]
+pub struct WorkspaceFolder {
+    #[serde(deserialize_with = "id_from_json")]
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<serde_json::Value>,
+    pub path: Option<String>,
+}
+
+/// List all folders in a workspace.
+pub async fn list_folders(token: &str, workspace_id: &str) -> Result<Vec<WorkspaceFolder>, String> {
+    let client = reqwest::Client::new();
+    let res = client
+        .get(format!("{}/workspaces/{}/folders", WS_BASE, workspace_id))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to list folders: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("API error: {}", res.status()));
+    }
+
+    let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let folders: Vec<WorkspaceFolder> = if let Some(items) = data.get("folders") {
+        serde_json::from_value(items.clone()).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    Ok(folders)
+}
+
 /// Get a presigned download URL for a file.
 pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
