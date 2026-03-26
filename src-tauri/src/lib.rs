@@ -234,17 +234,23 @@ async fn start_token_bridge(handle: tauri::AppHandle) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         if let Some(win) = handle.get_webview_window("main") {
-            // Inject JS that reads the cookie and calls set_token
+            // The hw_session cookie is httpOnly so JS can't read document.cookie.
+            // Instead, fetch the /api/auth/sync-token endpoint which returns the JWT.
+            // The browser sends the httpOnly cookie automatically with fetch().
             let js = r#"
-                (function() {
-                    var m = document.cookie.match(/(?:^|;\s*)hw_session=([^;]+)/);
-                    if (m && m[1] && window.__TAURI_INTERNALS__) {
-                        var current = window.__HW_SYNCED_TOKEN__;
-                        if (current !== m[1]) {
-                            window.__HW_SYNCED_TOKEN__ = m[1];
-                            window.__TAURI_INTERNALS__.invoke('set_token', { token: m[1] });
+                (async function() {
+                    try {
+                        var res = await fetch('/api/auth/sync-token', { credentials: 'include' });
+                        if (!res.ok) return;
+                        var data = await res.json();
+                        if (data.token && window.__TAURI_INTERNALS__) {
+                            var current = window.__HW_SYNCED_TOKEN__;
+                            if (current !== data.token) {
+                                window.__HW_SYNCED_TOKEN__ = data.token;
+                                window.__TAURI_INTERNALS__.invoke('set_token', { token: data.token });
+                            }
                         }
-                    }
+                    } catch(e) {}
                 })();
             "#;
             let _ = win.eval(js);
