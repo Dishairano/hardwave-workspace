@@ -163,6 +163,37 @@ fn open_sync_folder() -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn download_file(
+    workspace_id: String,
+    file_id: String,
+    filename: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let token = state.api_token.lock().unwrap().clone()
+        .ok_or("Not logged in")?;
+
+    // Get presigned download URL from API
+    let url = api::get_download_url(&token, &workspace_id, &file_id).await?;
+
+    // Pick save location — use the system Downloads folder
+    let downloads = dirs::download_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("Downloads"));
+    let _ = std::fs::create_dir_all(&downloads);
+    let save_path = downloads.join(&filename);
+
+    // Download the file bytes
+    let client = reqwest::Client::new();
+    let res = client.get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("Download error: {}", res.status()));
+    }
+    let bytes = res.bytes().await.map_err(|e| format!("Read error: {}", e))?;
+    std::fs::write(&save_path, &bytes).map_err(|e| format!("Save error: {}", e))?;
+
+    Ok(save_path.to_string_lossy().to_string())
+}
+
 // ─── Update Check ─────────────────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -338,6 +369,7 @@ pub fn run() {
             resume_sync,
             get_sync_folder,
             open_sync_folder,
+            download_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hardwave Workspace");

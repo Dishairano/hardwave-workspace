@@ -1,5 +1,15 @@
 use crate::models::AuthResponse;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Deserialize a JSON number or string into a String.
+fn id_from_json<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let v: serde_json::Value = Deserialize::deserialize(d)?;
+    match v {
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::String(s) => Ok(s),
+        _ => Err(serde::de::Error::custom("expected number or string")),
+    }
+}
 
 const BASE_URL: &str = "https://hardwavestudios.com/api";
 const WS_BASE: &str = "https://workspace.hardwavestudios.com/api";
@@ -41,19 +51,24 @@ pub async fn get_auth_status(token: &str) -> Result<bool, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct Workspace {
+    #[serde(deserialize_with = "id_from_json")]
     pub id: String,
     pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct WorkspaceFile {
+    #[serde(deserialize_with = "id_from_json")]
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub size: u64,
     pub folder_path: Option<String>,
     pub sha256: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

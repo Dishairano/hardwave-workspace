@@ -319,17 +319,27 @@ impl SyncEngine {
 
         let root = sync_root();
         let workspaces = api::list_workspaces(&token).await?;
+        eprintln!("[Sync] Full sync: {} workspace(s)", workspaces.len());
 
         for ws in &workspaces {
             let ws_dir = root.join(&ws.name);
             let _ = std::fs::create_dir_all(&ws_dir);
 
-            let remote_files = api::list_files(&token, &ws.id).await.unwrap_or_default();
+            let remote_files = match api::list_files(&token, &ws.id).await {
+                Ok(f) => {
+                    eprintln!("[Sync] Workspace '{}': {} remote file(s)", ws.name, f.len());
+                    f
+                }
+                Err(e) => {
+                    eprintln!("[Sync] Failed to list files for '{}': {}", ws.name, e);
+                    continue;
+                }
+            };
             let mut index = self.index.lock().await;
 
             // Check for remote files not in local index → download
             for rf in &remote_files {
-                let folder = rf.folder_path.as_deref().unwrap_or("");
+                let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
                 let rel_path = if folder.is_empty() {
                     format!("{}/{}", ws.name, rf.name)
                 } else {
@@ -345,6 +355,7 @@ impl SyncEngine {
                 };
 
                 if needs_download {
+                    eprintln!("[Sync] Downloading: {}", rel_path);
                     let local_path = root.join(&rel_path);
                     if let Some(parent) = local_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
