@@ -169,6 +169,7 @@ async fn download_file(
     workspace_id: String,
     file_id: String,
     filename: String,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let token = state.api_token.lock().unwrap().clone()
@@ -183,14 +184,38 @@ async fn download_file(
     let _ = std::fs::create_dir_all(&downloads);
     let save_path = downloads.join(&filename);
 
-    // Download the file bytes
+    // Stream download with progress
     let client = reqwest::Client::new();
     let res = client.get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
     if !res.status().is_success() {
         return Err(format!("Download error: {}", res.status()));
     }
-    let bytes = res.bytes().await.map_err(|e| format!("Read error: {}", e))?;
-    std::fs::write(&save_path, &bytes).map_err(|e| format!("Save error: {}", e))?;
+    let total = res.content_length().unwrap_or(0);
+    let mut stream = res.bytes_stream();
+    let mut file = tokio::fs::File::create(&save_path).await.map_err(|e| format!("Create file error: {}", e))?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u64 = 0;
+
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download stream error: {}", e))?;
+        file.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
+        downloaded += chunk.len() as u64;
+        let pct = if total > 0 { downloaded * 100 / total } else { 0 };
+        if pct != last_pct {
+            last_pct = pct;
+            if let Some(win) = app.get_webview_window("main") {
+                let js = format!(
+                    "window.__HW_DOWNLOAD_PROGRESS__ && window.__HW_DOWNLOAD_PROGRESS__({}, {}, {}, '{}');",
+                    pct, downloaded, total, filename.replace('\'', "\\'")
+                );
+                let _ = win.eval(&js);
+            }
+        }
+    }
+    file.flush().await.map_err(|e| format!("Flush error: {}", e))?;
 
     Ok(save_path.to_string_lossy().to_string())
 }
