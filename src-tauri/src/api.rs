@@ -253,12 +253,18 @@ pub async fn register_upload(token: &str, workspace_id: &str, file_id: &str) -> 
     Ok(())
 }
 
-/// Upload file bytes to a presigned S3 URL.
-pub async fn upload_to_s3(upload_url: &str, data: Vec<u8>) -> Result<(), String> {
+/// Upload a file to a presigned S3 URL by streaming from disk.
+pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Result<(), String> {
+    let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Open file error: {}", e))?;
+    let file_size = file.metadata().await.map_err(|e| e.to_string())?.len();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
     let client = reqwest::Client::new();
     let res = client
         .put(upload_url)
-        .body(data)
+        .header("content-length", file_size)
+        .body(body)
         .send()
         .await
         .map_err(|e| format!("S3 upload failed: {}", e))?;

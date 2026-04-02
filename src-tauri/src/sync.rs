@@ -325,10 +325,9 @@ impl SyncEngine {
         // Initiate upload
         let upload = api::init_upload(&token, &ws_id, filename, meta.len(), folder, &sha).await?;
 
-        // Read file and upload to S3
-        let data = std::fs::read(&full_path).map_err(|e| e.to_string())?;
+        // Stream file to S3
         self.emit_file_progress(rel_path, "upload", 50);
-        api::upload_to_s3(&upload.upload_url, data).await?;
+        api::upload_to_s3(&upload.upload_url, &full_path).await?;
 
         // Confirm upload
         api::register_upload(&token, &ws_id, &upload.file_id).await?;
@@ -471,42 +470,81 @@ impl SyncEngine {
                 }
             }
 
-            // Check for local files not on remote → upload
+            // Check for local files not on remote → upload (in parallel batches of 4)
             let local_files = scan_local(&ws_dir);
+
+            // Collect files that need uploading
+            let mut to_upload: Vec<(String, PathBuf, u64, String)> = Vec::new();
             for (local_rel, local_path, size) in &local_files {
                 let full_rel = format!("{}/{}", ws.name, local_rel);
                 if index.contains_key(&full_rel) {
                     continue; // Already synced
                 }
-                // Upload new local file
                 let sha = match hash_file(local_path) {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
-                let filename = local_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-                let folder = Path::new(local_rel).parent()
-                    .and_then(|p| p.to_str())
-                    .filter(|s| !s.is_empty());
+                to_upload.push((full_rel, local_path.clone(), *size, sha));
+            }
 
-                match api::init_upload(&token, &ws.id, filename, *size, folder, &sha).await {
-                    Ok(upload) => {
-                        if let Ok(data) = std::fs::read(local_path) {
-                            if api::upload_to_s3(&upload.upload_url, data).await.is_ok() {
-                                let _ = api::register_upload(&token, &ws.id, &upload.file_id).await;
-                                index.insert(full_rel.clone(), SyncEntry {
-                                    rel_path: full_rel,
-                                    sha256: sha,
-                                    modified: chrono::Utc::now().to_rfc3339(),
-                                    size: *size,
-                                    remote_id: Some(upload.file_id),
-                                    workspace_id: Some(ws.id.clone()),
-                                });
-                            }
+            // Process uploads in parallel batches of 4
+            for batch in to_upload.chunks(4) {
+                let mut tasks = Vec::new();
+
+                for (full_rel, local_path, size, sha) in batch {
+                    let token = token.clone();
+                    let ws_id = ws.id.clone();
+                    let ws_name = ws.name.clone();
+                    let full_rel = full_rel.clone();
+                    let local_path = local_path.clone();
+                    let size = *size;
+                    let sha = sha.clone();
+
+                    tasks.push(tokio::spawn(async move {
+                        // Derive filename and folder from the rel path within the workspace
+                        let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
+                            .unwrap_or(&full_rel);
+                        let filename = local_path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let folder = Path::new(rel_in_ws).parent()
+                            .and_then(|p| p.to_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+
+                        let upload = api::init_upload(
+                            &token, &ws_id, &filename, size,
+                            folder.as_deref(), &sha,
+                        ).await?;
+
+                        api::upload_to_s3(&upload.upload_url, &local_path).await?;
+                        api::register_upload(&token, &ws_id, &upload.file_id).await?;
+
+                        Ok::<_, String>((full_rel, sha, size, upload.file_id, ws_id))
+                    }));
+                }
+
+                let results = futures_util::future::join_all(tasks).await;
+                for result in results {
+                    match result {
+                        Ok(Ok((full_rel, sha, size, file_id, ws_id))) => {
+                            index.insert(full_rel.clone(), SyncEntry {
+                                rel_path: full_rel,
+                                sha256: sha,
+                                modified: chrono::Utc::now().to_rfc3339(),
+                                size,
+                                remote_id: Some(file_id),
+                                workspace_id: Some(ws_id),
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("[Sync] Upload failed: {}", e);
+                        }
+                        Err(e) => {
+                            eprintln!("[Sync] Upload task panicked: {}", e);
                         }
                     }
-                    Err(_) => continue,
                 }
             }
 
