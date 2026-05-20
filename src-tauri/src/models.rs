@@ -43,12 +43,4 @@ pub struct SyncStatus {
     pub error: Option<String>,
 }
 
-/// Progress event for individual file sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncFileProgress {
-    pub rel_path: String,
-    pub direction: String, // "upload" or "download"
-    pub percent: u8,
-    pub bytes_done: u64,
-    pub bytes_total: u64,
-}
+

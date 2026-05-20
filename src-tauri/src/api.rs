@@ -1,5 +1,7 @@
 use crate::models::AuthResponse;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Deserialize a JSON number or string into a String.
 fn id_from_json<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -11,12 +13,47 @@ fn id_from_json<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     }
 }
 
-const BASE_URL: &str = "https://hardwavestudios.com/api";
-const WS_BASE: &str = "https://workspace.hardwavestudios.com/api";
+/// Shared HTTP client with connection pooling and timeouts.
+pub fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
+
+/// API base URLs — override via HW_API_BASE and HW_WS_API_BASE env vars at build time.
+const BASE_URL: &str = option_env!("HW_API_BASE").unwrap_or("https://hardwavestudios.com/api");
+const WS_BASE: &str = option_env!("HW_WS_API_BASE").unwrap_or("https://workspace.hardwavestudios.com/api");
+
+/// Retry a fallible async operation up to `max_retries` times with exponential backoff.
+pub async fn with_retry<T>(
+    f: impl Fn() -> futures_util::future::BoxFuture<'static, Result<T, String>>,
+    max_retries: u32,
+) -> Result<T, String> {
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+            tokio::time::sleep(delay).await;
+        }
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                last_err = e;
+                eprintln!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
+            }
+        }
+    }
+    Err(format!("Failed after {} retries: {}", max_retries, last_err))
+}
 
 pub async fn login(email: &str, password: &str) -> Result<AuthResponse, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .post(format!("{}/auth/login", BASE_URL))
         .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
@@ -29,8 +66,7 @@ pub async fn login(email: &str, password: &str) -> Result<AuthResponse, String> 
 }
 
 pub async fn logout(token: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    let _ = client
+    let _ = http_client()
         .post(format!("{}/auth/logout", BASE_URL))
         .bearer_auth(token)
         .send()
@@ -39,8 +75,7 @@ pub async fn logout(token: &str) -> Result<(), String> {
 }
 
 pub async fn get_auth_status(token: &str) -> Result<bool, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .get(format!("{}/auth/me", BASE_URL))
         .bearer_auth(token)
         .send()
@@ -56,7 +91,7 @@ pub struct Workspace {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkspaceFile {
     #[serde(deserialize_with = "id_from_json")]
     pub id: String,
@@ -71,16 +106,9 @@ pub struct WorkspaceFile {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ListResponse<T> {
-    #[serde(default)]
-    items: Vec<T>,
-}
-
 /// List all workspaces for the authenticated user.
 pub async fn list_workspaces(token: &str) -> Result<Vec<Workspace>, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .get(format!("{}/workspaces", WS_BASE))
         .bearer_auth(token)
         .send()
@@ -108,8 +136,7 @@ pub async fn list_workspaces(token: &str) -> Result<Vec<Workspace>, String> {
 
 /// List all files in a workspace.
 pub async fn list_files(token: &str, workspace_id: &str) -> Result<Vec<WorkspaceFile>, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .get(format!("{}/workspaces/{}/files?all=true", WS_BASE, workspace_id))
         .bearer_auth(token)
         .send()
@@ -146,8 +173,7 @@ pub struct WorkspaceFolder {
 
 /// List all folders in a workspace.
 pub async fn list_folders(token: &str, workspace_id: &str) -> Result<Vec<WorkspaceFolder>, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .get(format!("{}/workspaces/{}/folders", WS_BASE, workspace_id))
         .bearer_auth(token)
         .send()
@@ -170,8 +196,7 @@ pub async fn list_folders(token: &str, workspace_id: &str) -> Result<Vec<Workspa
 
 /// Get a presigned download URL for a file.
 pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) -> Result<String, String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .get(format!("{}/workspaces/{}/files/{}", WS_BASE, workspace_id, file_id))
         .bearer_auth(token)
         .send()
@@ -207,7 +232,6 @@ pub async fn init_upload(
     folder_path: Option<&str>,
     sha256: &str,
 ) -> Result<UploadInitResponse, String> {
-    let client = reqwest::Client::new();
     let mut body = serde_json::json!({
         "name": filename,
         "size": size,
@@ -217,7 +241,7 @@ pub async fn init_upload(
         body["folder_path"] = serde_json::Value::String(fp.to_string());
     }
 
-    let res = client
+    let res = http_client()
         .post(format!("{}/workspaces/{}/files", WS_BASE, workspace_id))
         .bearer_auth(token)
         .json(&body)
@@ -237,8 +261,7 @@ pub async fn init_upload(
 
 /// Confirm upload completion.
 pub async fn register_upload(token: &str, workspace_id: &str, file_id: &str) -> Result<(), String> {
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .post(format!("{}/workspaces/{}/files/register", WS_BASE, workspace_id))
         .bearer_auth(token)
         .json(&serde_json::json!({ "file_id": file_id }))
@@ -260,8 +283,7 @@ pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Resu
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = reqwest::Body::wrap_stream(stream);
 
-    let client = reqwest::Client::new();
-    let res = client
+    let res = http_client()
         .put(upload_url)
         .header("content-length", file_size)
         .body(body)

@@ -5,16 +5,28 @@ mod sync;
 use models::SyncStatus;
 use std::sync::Arc;
 use tauri::{
-    Emitter, Manager, State,
+    Manager, State, WebviewWindow,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
 use tokio::sync::Mutex as TokioMutex;
 
 pub struct AppState {
-    pub api_token: std::sync::Mutex<Option<String>>,
+    pub api_token: TokioMutex<Option<String>>,
     pub sync_engine: TokioMutex<Option<Arc<sync::SyncEngine>>>,
-    pub auto_sync: std::sync::Mutex<bool>,
+    pub auto_sync: TokioMutex<bool>,
+}
+
+/// Safely call a frontend function with serializable data.
+/// Embeds JSON directly as a JS expression (valid JSON is valid JS).
+pub fn safe_eval<T: serde::Serialize>(win: &WebviewWindow, fn_name: &str, data: &T) {
+    let Ok(json) = serde_json::to_string(data) else { return };
+    let fn_safe = fn_name.replace('\'', "").replace('\\', "");
+    let js = format!(
+        "try{{window['{}'] && window['{}']({})}}catch(e){{}}",
+        fn_safe, fn_safe, json
+    );
+    let _ = win.eval(&js);
 }
 
 /// Shared auth token path — same as VSTs and Suite.
@@ -58,9 +70,8 @@ async fn login(
     let res = api::login(&email, &password).await?;
     if res.success {
         if let Some(ref token) = res.token {
-            *state.api_token.lock().unwrap() = Some(token.clone());
+            *state.api_token.lock().await = Some(token.clone());
             sync_vst_token(Some(token));
-            // Update sync engine token
             if let Some(engine) = state.sync_engine.lock().await.as_ref() {
                 engine.set_token(Some(token.clone())).await;
             }
@@ -71,11 +82,11 @@ async fn login(
 
 #[tauri::command]
 async fn logout(state: State<'_, AppState>) -> Result<(), String> {
-    let token = state.api_token.lock().unwrap().clone();
+    let token = state.api_token.lock().await.clone();
     if let Some(t) = token {
         let _ = api::logout(&t).await;
     }
-    *state.api_token.lock().unwrap() = None;
+    *state.api_token.lock().await = None;
     sync_vst_token(None);
     if let Some(engine) = state.sync_engine.lock().await.as_ref() {
         engine.set_token(None).await;
@@ -85,7 +96,7 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_auth_status(state: State<'_, AppState>) -> Result<bool, String> {
-    let token = state.api_token.lock().unwrap().clone();
+    let token = state.api_token.lock().await.clone();
     match token {
         Some(t) => api::get_auth_status(&t).await,
         None => Ok(false),
@@ -94,7 +105,7 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 async fn set_token(token: String, state: State<'_, AppState>) -> Result<(), String> {
-    *state.api_token.lock().unwrap() = Some(token.clone());
+    *state.api_token.lock().await = Some(token.clone());
     sync_vst_token(Some(&token));
     if let Some(engine) = state.sync_engine.lock().await.as_ref() {
         engine.set_token(Some(token)).await;
@@ -172,21 +183,17 @@ async fn download_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let token = state.api_token.lock().unwrap().clone()
+    let token = state.api_token.lock().await.clone()
         .ok_or("Not logged in")?;
 
-    // Get presigned download URL from API
     let url = api::get_download_url(&token, &workspace_id, &file_id).await?;
 
-    // Pick save location — use the system Downloads folder
     let downloads = dirs::download_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("Downloads"));
     let _ = std::fs::create_dir_all(&downloads);
     let save_path = downloads.join(&filename);
 
-    // Stream download with progress
-    let client = reqwest::Client::new();
-    let res = client.get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    let res = api::http_client().get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
     if !res.status().is_success() {
         return Err(format!("Download error: {}", res.status()));
     }
@@ -207,11 +214,12 @@ async fn download_file(
         if pct != last_pct {
             last_pct = pct;
             if let Some(win) = app.get_webview_window("main") {
-                let js = format!(
-                    "window.__HW_DOWNLOAD_PROGRESS__ && window.__HW_DOWNLOAD_PROGRESS__({}, {}, {}, '{}');",
-                    pct, downloaded, total, filename.replace('\'', "\\'")
-                );
-                let _ = win.eval(&js);
+                safe_eval(&win, "__HW_DOWNLOAD_PROGRESS__", &serde_json::json!({
+                    "pct": pct,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "filename": filename,
+                }));
             }
         }
     }
@@ -222,7 +230,7 @@ async fn download_file(
 
 #[tauri::command]
 async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
-    *state.auto_sync.lock().unwrap() = enabled;
+    *state.auto_sync.lock().await = enabled;
     if let Some(engine) = state.sync_engine.lock().await.as_ref() {
         if enabled {
             engine.resume().await;
@@ -230,18 +238,19 @@ async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(
             engine.pause().await;
         }
     }
-    // Persist preference
     if let Some(dir) = dirs::data_dir() {
         let pref_path = dir.join("hardwave").join("auto_sync");
-        let _ = std::fs::create_dir_all(pref_path.parent().unwrap());
+        if let Some(parent) = pref_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(&pref_path, if enabled { "1" } else { "0" });
     }
     Ok(())
 }
 
 #[tauri::command]
-fn get_auto_sync(state: State<'_, AppState>) -> bool {
-    *state.auto_sync.lock().unwrap()
+async fn get_auto_sync(state: State<'_, AppState>) -> bool {
+    *state.auto_sync.lock().await
 }
 
 fn load_auto_sync_pref() -> bool {
@@ -306,16 +315,12 @@ async fn check_for_updates(handle: tauri::AppHandle) {
         }
     };
 
-    // Set window variable so the frontend modal picks it up
-    let version = update.version.clone();
-    let body = update.body.clone().unwrap_or_default().replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
-    let current = env!("CARGO_PKG_VERSION");
     if let Some(win) = handle.get_webview_window("main") {
-        let js = format!(
-            "window.__HW_UPDATE__ = {{ version: '{}', body: '{}', currentVersion: '{}' }};",
-            version, body, current
-        );
-        let _ = win.eval(&js);
+        safe_eval(&win, "__HW_UPDATE__", &serde_json::json!({
+            "version": update.version,
+            "body": update.body.unwrap_or_default(),
+            "currentVersion": env!("CARGO_PKG_VERSION"),
+        }));
     }
 }
 
@@ -396,7 +401,7 @@ pub fn run() {
                             });
                         }
                         "quit" => {
-                            std::process::exit(0);
+                            app.exit(0);
                         }
                         _ => {}
                     }
@@ -424,30 +429,29 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let engine = Arc::new(sync::SyncEngine::new(handle.clone()));
 
-                // Load existing auth token
+                // Store engine in state FIRST so set_token from bridge finds it
+                let app_state = handle.state::<AppState>();
+                *app_state.sync_engine.lock().await = Some(Arc::clone(&engine));
+
+                // Load existing auth token (also done via set_token, which calls engine.set_token)
                 if let Some(token) = load_saved_token() {
+                    api::http_client(); // init shared client early
                     engine.set_token(Some(token)).await;
                 }
 
-                // If auto-sync is disabled, start paused
                 if !auto_sync_enabled {
                     engine.pause().await;
                 }
 
-                // Store engine in state
-                let app_state = handle.state::<AppState>();
-                *app_state.sync_engine.lock().await = Some(Arc::clone(&engine));
-
-                // Start the sync loop
                 engine.start().await;
             });
 
             Ok(())
         })
         .manage(AppState {
-            api_token: std::sync::Mutex::new(load_saved_token()),
+            api_token: TokioMutex::new(load_saved_token()),
             sync_engine: TokioMutex::new(None),
-            auto_sync: std::sync::Mutex::new(load_auto_sync_pref()),
+            auto_sync: TokioMutex::new(load_auto_sync_pref()),
         })
         .invoke_handler(tauri::generate_handler![
             login,

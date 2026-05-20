@@ -4,12 +4,14 @@
 //! Workspace API for remote changes. Uses SHA-256 hashes to detect diffs.
 
 use crate::api;
-use crate::models::{SyncEntry, SyncFileProgress, SyncStatus};
+use crate::models::{SyncEntry, SyncStatus};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tauri::{Emitter, Manager};
 
@@ -51,12 +53,28 @@ fn write_index(index: &HashMap<String, SyncEntry>) {
     }
 }
 
-/// Compute SHA-256 of a file.
+/// Compute SHA-256 of a file using buffered reads (avoids loading entire file into RAM).
 fn hash_file(path: &Path) -> Result<String, String> {
-    let data = std::fs::read(path).map_err(|e| format!("Read error: {}", e))?;
+    let file = std::fs::File::open(path).map_err(|e| format!("Open error: {}", e))?;
+    let mut reader = std::io::BufReader::with_capacity(65536, file);
     let mut hasher = Sha256::new();
-    hasher.update(&data);
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("Read error: {}", e))?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Validate that a path component is safe (no path traversal).
+fn is_safe_component(name: &str) -> bool {
+    !name.contains("..") && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
+}
+
+/// Validate that a relative path is safe (allows `/` separators, rejects traversal).
+fn is_safe_rel_path(path: &str) -> bool {
+    !path.contains("..") && !path.contains('\\') && !path.contains('\0')
 }
 
 /// Scan the sync root and return all files with their hashes.
@@ -100,6 +118,7 @@ pub struct SyncEngine {
     index: Arc<Mutex<HashMap<String, SyncEntry>>>,
     app: tauri::AppHandle,
     paused: Arc<RwLock<bool>>,
+    sync_active: AtomicBool,
 }
 
 impl SyncEngine {
@@ -117,6 +136,7 @@ impl SyncEngine {
             index: Arc::new(Mutex::new(index)),
             app,
             paused: Arc::new(RwLock::new(false)),
+            sync_active: AtomicBool::new(false),
         }
     }
 
@@ -124,23 +144,25 @@ impl SyncEngine {
         let is_new = token.is_some();
         *self.token.write().await = token.clone();
 
-        // As soon as we get a token, create workspace + subfolder directories
         if is_new {
             if let Some(t) = token {
                 let root = sync_root();
                 let _ = std::fs::create_dir_all(&root);
                 if let Ok(workspaces) = api::list_workspaces(&t).await {
                     for ws in &workspaces {
+                        if !is_safe_component(&ws.name) {
+                            eprintln!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
+                            continue;
+                        }
                         let ws_dir = root.join(&ws.name);
                         let _ = std::fs::create_dir_all(&ws_dir);
                         eprintln!("[Sync] Created workspace folder: {}", ws_dir.display());
-                        // Also create all subfolders
                         if let Ok(folders) = api::list_folders(&t, &ws.id).await {
                             for f in &folders {
                                 let folder_path = f.path.as_deref()
                                     .unwrap_or(&f.name)
                                     .trim_matches('/');
-                                if !folder_path.is_empty() {
+                                if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                                     let dir = ws_dir.join(folder_path);
                                     let _ = std::fs::create_dir_all(&dir);
                                     eprintln!("[Sync] Created subfolder: {}", dir.display());
@@ -174,28 +196,26 @@ impl SyncEngine {
         let _ = self.app.emit("sync:status", status.clone());
     }
 
-    /// Push per-file sync progress to the webview via eval().
+    /// Push per-file sync progress to the webview via safe eval.
     fn emit_file_progress(&self, rel_path: &str, direction: &str, percent: u32) {
         if let Some(win) = self.app.get_webview_window("main") {
-            let escaped = rel_path.replace('\\', "\\\\").replace('\'', "\\'");
-            let js = format!(
-                "window.__HW_SYNC_FILE__ = {{ rel_path: '{}', direction: '{}', percent: {} }};",
-                escaped, direction, percent
-            );
-            let _ = win.eval(&js);
+            crate::safe_eval(&win, "__HW_SYNC_FILE__", &serde_json::json!({
+                "rel_path": rel_path,
+                "direction": direction,
+                "percent": percent,
+            }));
         }
     }
 
     /// Emit a conflict warning to the webview.
     fn emit_conflict(&self, rel_path: &str, local_size: u64, remote_size: u64) {
         if let Some(win) = self.app.get_webview_window("main") {
-            let escaped = rel_path.replace('\\', "\\\\").replace('\'', "\\'");
-            let js = format!(
-                "window.__HW_SYNC_CONFLICTS__ = window.__HW_SYNC_CONFLICTS__ || []; \
-                 window.__HW_SYNC_CONFLICTS__.push({{ rel_path: '{}', local_size: {}, remote_size: {}, time: Date.now() }});",
-                escaped, local_size, remote_size
-            );
-            let _ = win.eval(&js);
+            crate::safe_eval(&win, "__HW_SYNC_CONFLICTS__", &serde_json::json!({
+                "rel_path": rel_path,
+                "local_size": local_size,
+                "remote_size": remote_size,
+                "time": chrono::Utc::now().timestamp_millis(),
+            }));
         }
         eprintln!("[Sync] CONFLICT: '{}' exists locally ({} bytes) but differs from remote ({} bytes)", rel_path, local_size, remote_size);
     }
@@ -211,7 +231,6 @@ impl SyncEngine {
 
         let watch_root = root.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Handle::current();
             let tx = fs_tx;
             let mut watcher = match notify::recommended_watcher(move |res: Result<Event, _>| {
                 if let Ok(event) = res {
@@ -229,9 +248,15 @@ impl SyncEngine {
                 }
             }) {
                 Ok(w) => w,
-                Err(_) => return,
+                Err(e) => {
+                    eprintln!("[Sync] Failed to create file watcher: {}", e);
+                    return;
+                }
             };
-            let _ = watcher.watch(&root, RecursiveMode::Recursive);
+            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+                eprintln!("[Sync] Failed to start watching '{}': {}", root.display(), e);
+                return;
+            }
             // Keep the watcher alive
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(3600));
@@ -269,17 +294,14 @@ impl SyncEngine {
         let token = self.token.read().await.clone();
         let token = match token {
             Some(t) => t,
-            None => return Ok(()), // Not logged in
+            None => return Ok(()),
         };
 
         let root = sync_root();
         let full_path = root.join(rel_path);
 
-        let mut index = self.index.lock().await;
-
         if !full_path.exists() {
-            // File deleted locally — remove from index
-            // TODO: delete from remote
+            let mut index = self.index.lock().await;
             index.remove(rel_path);
             write_index(&index);
             return Ok(());
@@ -288,28 +310,32 @@ impl SyncEngine {
         let meta = std::fs::metadata(&full_path).map_err(|e| e.to_string())?;
         let sha = hash_file(&full_path)?;
 
-        // Check if file changed since last sync
-        if let Some(entry) = index.get(rel_path) {
-            if entry.sha256 == sha {
-                return Ok(()); // No change
+        // Check hash against index (brief lock)
+        {
+            let index = self.index.lock().await;
+            if let Some(entry) = index.get(rel_path) {
+                if entry.sha256 == sha {
+                    return Ok(());
+                }
             }
         }
 
-        // Determine workspace from folder structure:
-        // ~/Hardwave/<workspace_name>/path/to/file
         let parts: Vec<&str> = rel_path.splitn(2, '/').collect();
         if parts.len() < 2 {
-            return Ok(()); // File at root level — skip
+            return Ok(());
         }
         let workspace_name = parts[0];
         let file_path_in_ws = parts[1];
 
-        // Find workspace ID by name
+        if !is_safe_component(workspace_name) {
+            return Err(format!("Unsafe workspace name: {}", workspace_name));
+        }
+
         let workspaces = api::list_workspaces(&token).await?;
         let ws = workspaces.iter().find(|w| w.name == workspace_name);
         let ws_id = match ws {
             Some(w) => w.id.clone(),
-            None => return Ok(()), // Workspace not found — skip
+            None => return Ok(()),
         };
 
         let filename = full_path.file_name()
@@ -322,27 +348,46 @@ impl SyncEngine {
         self.update_status("syncing", None).await;
         self.emit_file_progress(rel_path, "upload", 0);
 
-        // Initiate upload
-        let upload = api::init_upload(&token, &ws_id, filename, meta.len(), folder, &sha).await?;
+        // Upload with retry (no index lock held)
+        let file_size = meta.len();
+        let upload = api::with_retry({
+            let token = token.clone();
+            let ws_id = ws_id.clone();
+            let filename = filename.to_string();
+            let folder = folder.map(|s| s.to_string());
+            let sha = sha.clone();
+            let full_path = full_path.clone();
+            move || {
+                let token = token.clone();
+                let ws_id = ws_id.clone();
+                let filename = filename.clone();
+                let folder = folder.clone();
+                let sha = sha.clone();
+                let full_path = full_path.clone();
+                Box::pin(async move {
+                    let u = api::init_upload(&token, &ws_id, &filename, file_size, folder.as_deref(), &sha).await?;
+                    api::upload_to_s3(&u.upload_url, &full_path).await?;
+                    api::register_upload(&token, &ws_id, &u.file_id).await?;
+                    Ok::<_, String>((u.file_id, ws_id))
+                })
+            }
+        }, 2).await?;
 
-        // Stream file to S3
-        self.emit_file_progress(rel_path, "upload", 50);
-        api::upload_to_s3(&upload.upload_url, &full_path).await?;
-
-        // Confirm upload
-        api::register_upload(&token, &ws_id, &upload.file_id).await?;
         self.emit_file_progress(rel_path, "upload", 100);
 
-        // Update index
-        index.insert(rel_path.to_string(), SyncEntry {
-            rel_path: rel_path.to_string(),
-            sha256: sha,
-            modified: chrono::Utc::now().to_rfc3339(),
-            size: meta.len(),
-            remote_id: Some(upload.file_id),
-            workspace_id: Some(ws_id),
-        });
-        write_index(&index);
+        // Update index (brief lock)
+        {
+            let mut index = self.index.lock().await;
+            index.insert(rel_path.to_string(), SyncEntry {
+                rel_path: rel_path.to_string(),
+                sha256: sha,
+                modified: chrono::Utc::now().to_rfc3339(),
+                size: meta.len(),
+                remote_id: Some(upload.0),
+                workspace_id: Some(upload.1),
+            });
+            write_index(&index);
+        }
 
         self.update_status("idle", None).await;
         Ok(())
@@ -350,6 +395,13 @@ impl SyncEngine {
 
     /// Full bidirectional sync — compare local index with remote state.
     async fn full_sync(&self) -> Result<(), String> {
+        // Prevent overlapping sync cycles
+        if self.sync_active.swap(true, Ordering::SeqCst) {
+            eprintln!("[Sync] Full sync already in progress, skipping");
+            return Ok(());
+        }
+        let _guard = SyncGuard(&self.sync_active);
+
         let token = self.token.read().await.clone();
         let token = match token {
             Some(t) => t,
@@ -358,27 +410,48 @@ impl SyncEngine {
 
         self.update_status("syncing", None).await;
 
+        let result = self.do_full_sync(&token).await;
+
+        let mut status = self.status.write().await;
+        if result.is_ok() {
+            status.state = "idle".into();
+            status.last_sync = Some(chrono::Utc::now().to_rfc3339());
+            status.error = None;
+        } else {
+            status.state = "error".into();
+            status.error = Some(result.as_ref().unwrap_err().clone());
+        }
+        let _ = self.app.emit("sync:status", status.clone());
+
+        result
+    }
+
+    /// Inner sync logic (status already set to "syncing").
+    async fn do_full_sync(&self, token: &str) -> Result<(), String> {
         let root = sync_root();
-        let workspaces = api::list_workspaces(&token).await?;
+        let workspaces = api::list_workspaces(token).await?;
         eprintln!("[Sync] Full sync: {} workspace(s)", workspaces.len());
 
         for ws in &workspaces {
+            if !is_safe_component(&ws.name) {
+                eprintln!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
+                continue;
+            }
             let ws_dir = root.join(&ws.name);
             let _ = std::fs::create_dir_all(&ws_dir);
 
-            // Create all subfolders (even empty ones)
-            if let Ok(folders) = api::list_folders(&token, &ws.id).await {
+            if let Ok(folders) = api::list_folders(token, &ws.id).await {
                 for f in &folders {
                     let folder_path = f.path.as_deref()
                         .unwrap_or(&f.name)
                         .trim_matches('/');
-                    if !folder_path.is_empty() {
+                    if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                         let _ = std::fs::create_dir_all(ws_dir.join(folder_path));
                     }
                 }
             }
 
-            let remote_files = match api::list_files(&token, &ws.id).await {
+            let remote_files = match api::list_files(token, &ws.id).await {
                 Ok(f) => {
                     eprintln!("[Sync] Workspace '{}': {} remote file(s)", ws.name, f.len());
                     f
@@ -388,111 +461,133 @@ impl SyncEngine {
                     continue;
                 }
             };
-            let mut index = self.index.lock().await;
 
-            // Check for remote files not in local index → download
-            for rf in &remote_files {
-                let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
-                let rel_path = if folder.is_empty() {
-                    format!("{}/{}", ws.name, rf.name)
-                } else {
-                    format!("{}/{}/{}", ws.name, folder, rf.name)
-                };
+            // ── Download phase ─────────────────────────────────────
+            // Determine what needs downloading (index lock held briefly)
+            let to_download: Vec<(String, api::WorkspaceFile)> = {
+                let idx = self.index.lock().await;
+                remote_files.iter().filter_map(|rf| {
+                    let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
+                    let rel_path = if folder.is_empty() {
+                        format!("{}/{}", ws.name, rf.name)
+                    } else {
+                        format!("{}/{}/{}", ws.name, folder, rf.name)
+                    };
+                    let should = match idx.get(&rel_path) {
+                        Some(e) => rf.sha256.as_deref() != Some(&e.sha256),
+                        None => true,
+                    };
+                    should.then(|| (rel_path, rf.clone()))
+                }).collect()
+            };
 
-                let needs_download = match index.get(&rel_path) {
-                    Some(entry) => {
-                        // If remote has a different hash, download it
-                        rf.sha256.as_deref() != Some(&entry.sha256)
-                    }
-                    None => true, // Not in index — new remote file
-                };
+            // Process downloads without holding the index lock
+            let mut downloaded: Vec<SyncEntry> = Vec::new();
+            for (rel_path, rf) in &to_download {
+                let local_path = root.join(&rel_path);
 
-                if needs_download {
-                    let local_path = root.join(&rel_path);
-
-                    // Conflict detection: file exists locally but not in our index
-                    if local_path.exists() && !index.contains_key(&rel_path) {
-                        let local_size = local_path.metadata().map(|m| m.len()).unwrap_or(0);
-                        let local_hash = hash_file(&local_path).unwrap_or_default();
-                        // If local hash matches remote, just index it — no download needed
-                        if rf.sha256.as_deref() == Some(&local_hash) {
-                            eprintln!("[Sync] Already exists (same hash): {}", rel_path);
-                            index.insert(rel_path.clone(), SyncEntry {
-                                rel_path: rel_path.clone(),
-                                sha256: local_hash,
-                                modified: chrono::Utc::now().to_rfc3339(),
-                                size: local_size,
-                                remote_id: Some(rf.id.clone()),
-                                workspace_id: Some(ws.id.clone()),
-                            });
-                            continue;
-                        }
-                        // Different content — emit conflict warning, skip this file
-                        self.emit_conflict(&rel_path, local_size, rf.size);
+                // Conflict: file exists locally but not indexed
+                if local_path.exists() {
+                    let local_hash = hash_file(&local_path).unwrap_or_default();
+                    if rf.sha256.as_deref() == Some(&local_hash) {
+                        eprintln!("[Sync] Already exists (same hash): {}", rel_path);
+                        downloaded.push(SyncEntry {
+                            rel_path: rel_path.clone(),
+                            sha256: local_hash,
+                            modified: chrono::Utc::now().to_rfc3339(),
+                            size: local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                            remote_id: Some(rf.id.clone()),
+                            workspace_id: Some(ws.id.clone()),
+                        });
                         continue;
                     }
+                    self.emit_conflict(rel_path, local_path.metadata().map(|m| m.len()).unwrap_or(0), rf.size);
+                    continue;
+                }
 
-                    eprintln!("[Sync] Downloading: {}", rel_path);
-                    if let Some(parent) = local_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                eprintln!("[Sync] Downloading: {}", rel_path);
+                if let Some(parent) = local_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                self.emit_file_progress(rel_path, "download", 0);
+                // Download with retry
+                let dl = api::with_retry({
+                    let token = token.to_string();
+                    let ws_id = ws.id.clone();
+                    let rf_id = rf.id.clone();
+                    let rel_path = rel_path.clone();
+                    move || {
+                        let token = token.clone();
+                        let ws_id = ws_id.clone();
+                        let rf_id = rf_id.clone();
+                        let rel_path = rel_path.clone();
+                        Box::pin(async move {
+                            let url = api::get_download_url(&token, &ws_id, &rf_id).await?;
+                            let bytes = api::http_client().get(&url).send().await
+                                .map_err(|e| format!("Download failed: {}", e))?
+                                .bytes().await
+                                .map_err(|e| format!("Read body failed: {}", e))?;
+                            let sha = {
+                                let mut h = Sha256::new();
+                                h.update(&bytes);
+                                hex::encode(h.finalize())
+                            };
+                            let local_path = sync_root().join(&rel_path);
+                            std::fs::write(&local_path, &bytes)
+                                .map_err(|e| format!("Write failed: {}", e))?;
+                            Ok((sha, bytes.len() as u64))
+                        })
                     }
+                }, 2).await;
 
-                    // Download
-                    match api::get_download_url(&token, &ws.id, &rf.id).await {
-                        Ok(url) => {
-                            self.emit_file_progress(&rel_path, "download", 0);
-
-                            let client = reqwest::Client::new();
-                            if let Ok(res) = client.get(&url).send().await {
-                                if let Ok(bytes) = res.bytes().await {
-                                    let _ = std::fs::write(&local_path, &bytes);
-                                    let sha = {
-                                        let mut h = Sha256::new();
-                                        h.update(&bytes);
-                                        hex::encode(h.finalize())
-                                    };
-
-                                    index.insert(rel_path.clone(), SyncEntry {
-                                        rel_path: rel_path.clone(),
-                                        sha256: sha,
-                                        modified: chrono::Utc::now().to_rfc3339(),
-                                        size: rf.size,
-                                        remote_id: Some(rf.id.clone()),
-                                        workspace_id: Some(ws.id.clone()),
-                                    });
-
-                                    self.emit_file_progress(&rel_path, "download", 100);
-                                }
-                            }
-                        }
-                        Err(_) => continue,
+                match dl {
+                    Ok((sha, size)) => {
+                        downloaded.push(SyncEntry {
+                            rel_path: rel_path.clone(),
+                            sha256: sha,
+                            modified: chrono::Utc::now().to_rfc3339(),
+                            size,
+                            remote_id: Some(rf.id.clone()),
+                            workspace_id: Some(ws.id.clone()),
+                        });
+                        self.emit_file_progress(rel_path, "download", 100);
+                    }
+                    Err(e) => {
+                        eprintln!("[Sync] Download failed for '{}': {}", rel_path, e);
                     }
                 }
             }
 
-            // Check for local files not on remote → upload (in parallel batches of 4)
+            // Update index with downloaded files (brief lock)
+            if !downloaded.is_empty() {
+                let mut idx = self.index.lock().await;
+                for e in &downloaded {
+                    idx.insert(e.rel_path.clone(), e.clone());
+                }
+                write_index(&idx);
+            }
+
+            // ── Upload phase ────────────────────────────────────────
             let local_files = scan_local(&ws_dir);
 
-            // Collect files that need uploading
-            let mut to_upload: Vec<(String, PathBuf, u64, String)> = Vec::new();
-            for (local_rel, local_path, size) in &local_files {
-                let full_rel = format!("{}/{}", ws.name, local_rel);
-                if index.contains_key(&full_rel) {
-                    continue; // Already synced
-                }
-                let sha = match hash_file(local_path) {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                to_upload.push((full_rel, local_path.clone(), *size, sha));
-            }
+            // Determine what needs uploading (brief index lock)
+            let to_upload: Vec<(String, PathBuf, u64, String)> = {
+                let idx = self.index.lock().await;
+                local_files.iter().filter_map(|(local_rel, local_path, size)| {
+                    let full_rel = format!("{}/{}", ws.name, local_rel);
+                    if idx.contains_key(&full_rel) { return None; }
+                    let sha = hash_file(local_path).ok()?;
+                    Some((full_rel, local_path.clone(), *size, sha))
+                }).collect()
+            };
 
-            // Process uploads in parallel batches of 4
+            // Upload in parallel batches of 4 (no index lock held)
+            let mut uploaded: Vec<SyncEntry> = Vec::new();
             for batch in to_upload.chunks(4) {
                 let mut tasks = Vec::new();
-
                 for (full_rel, local_path, size, sha) in batch {
-                    let token = token.clone();
+                    let token = token.to_string();
                     let ws_id = ws.id.clone();
                     let ws_name = ws.name.clone();
                     let full_rel = full_rel.clone();
@@ -501,7 +596,6 @@ impl SyncEngine {
                     let sha = sha.clone();
 
                     tasks.push(tokio::spawn(async move {
-                        // Derive filename and folder from the rel path within the workspace
                         let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
                             .unwrap_or(&full_rel);
                         let filename = local_path.file_name()
@@ -513,15 +607,29 @@ impl SyncEngine {
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
 
-                        let upload = api::init_upload(
-                            &token, &ws_id, &filename, size,
-                            folder.as_deref(), &sha,
-                        ).await?;
-
-                        api::upload_to_s3(&upload.upload_url, &local_path).await?;
-                        api::register_upload(&token, &ws_id, &upload.file_id).await?;
-
-                        Ok::<_, String>((full_rel, sha, size, upload.file_id, ws_id))
+                        let upload = api::with_retry({
+                            let token = token.clone();
+                            let ws_id = ws_id.clone();
+                            let filename = filename.clone();
+                            let folder = folder.clone();
+                            let sha = sha.clone();
+                            let local_path = local_path.clone();
+                            move || {
+                                let token = token.clone();
+                                let ws_id = ws_id.clone();
+                                let filename = filename.clone();
+                                let folder = folder.clone();
+                                let sha = sha.clone();
+                                let local_path = local_path.clone();
+                                Box::pin(async move {
+                                    let up = api::init_upload(&token, &ws_id, &filename, size, folder.as_deref(), &sha).await?;
+                                    api::upload_to_s3(&up.upload_url, &local_path).await?;
+                                    api::register_upload(&token, &ws_id, &up.file_id).await?;
+                                    Ok::<_, String>((full_rel.clone(), sha.clone(), size, up.file_id, ws_id.clone()))
+                                })
+                            }
+                        }, 2).await?;
+                        Ok::<_, String>(upload)
                     }));
                 }
 
@@ -529,7 +637,7 @@ impl SyncEngine {
                 for result in results {
                     match result {
                         Ok(Ok((full_rel, sha, size, file_id, ws_id))) => {
-                            index.insert(full_rel.clone(), SyncEntry {
+                            uploaded.push(SyncEntry {
                                 rel_path: full_rel,
                                 sha256: sha,
                                 modified: chrono::Utc::now().to_rfc3339(),
@@ -538,25 +646,30 @@ impl SyncEngine {
                                 workspace_id: Some(ws_id),
                             });
                         }
-                        Ok(Err(e)) => {
-                            eprintln!("[Sync] Upload failed: {}", e);
-                        }
-                        Err(e) => {
-                            eprintln!("[Sync] Upload task panicked: {}", e);
-                        }
+                        Ok(Err(e)) => eprintln!("[Sync] Upload failed: {}", e),
+                        Err(e) => eprintln!("[Sync] Upload task panicked: {}", e),
                     }
                 }
             }
 
-            write_index(&index);
+            // Update index with uploaded files (brief lock)
+            if !uploaded.is_empty() {
+                let mut idx = self.index.lock().await;
+                for e in &uploaded {
+                    idx.insert(e.rel_path.clone(), e.clone());
+                }
+                write_index(&idx);
+            }
         }
 
-        let mut status = self.status.write().await;
-        status.state = "idle".into();
-        status.last_sync = Some(chrono::Utc::now().to_rfc3339());
-        status.error = None;
-        let _ = self.app.emit("sync:status", status.clone());
-
         Ok(())
+    }
+}
+
+/// RAII guard to reset sync_active on scope exit.
+struct SyncGuard<'a>(&'a AtomicBool);
+impl Drop for SyncGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
