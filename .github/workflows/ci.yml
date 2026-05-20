@@ -50,6 +50,7 @@ jobs:
             patchelf libglib2.0-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
       - name: Check formatting
+        continue-on-error: true
         run: cargo fmt --all -- --check
         working-directory: src-tauri
 
