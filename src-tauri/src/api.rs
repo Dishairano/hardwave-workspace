@@ -30,6 +30,9 @@ pub fn http_client() -> &'static reqwest::Client {
 const BASE_URL: &str = option_env!("HW_API_BASE").unwrap_or("https://hardwavestudios.com/api");
 const WS_BASE: &str = option_env!("HW_WS_API_BASE").unwrap_or("https://workspace.hardwavestudios.com/api");
 
+/// Expose WS_BASE for SSE URL construction in other modules.
+pub fn ws_base() -> &'static str { WS_BASE }
+
 /// Retry a fallible async operation up to `max_retries` times with exponential backoff.
 pub async fn with_retry<T>(
     f: impl Fn() -> futures_util::future::BoxFuture<'static, Result<T, String>>,

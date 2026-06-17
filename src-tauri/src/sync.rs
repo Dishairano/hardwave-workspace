@@ -119,6 +119,10 @@ pub struct SyncEngine {
     app: tauri::AppHandle,
     paused: Arc<RwLock<bool>>,
     sync_active: AtomicBool,
+    /// Abort handles for per-workspace SSE listener tasks.
+    sse_handles: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Notified by SSE listeners to trigger an immediate full sync.
+    sse_trigger: Arc<tokio::sync::Notify>,
 }
 
 impl SyncEngine {
@@ -137,10 +141,18 @@ impl SyncEngine {
             app,
             paused: Arc::new(RwLock::new(false)),
             sync_active: AtomicBool::new(false),
+            sse_handles: Mutex::new(Vec::new()),
+            sse_trigger: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub async fn set_token(&self, token: Option<String>) {
+        // Abort any existing SSE connections (token changed or logged out)
+        {
+            let mut handles = self.sse_handles.lock().await;
+            for h in handles.drain(..) { h.abort(); }
+        }
+
         let is_new = token.is_some();
         *self.token.write().await = token.clone();
 
@@ -169,6 +181,10 @@ impl SyncEngine {
                                 }
                             }
                         }
+
+                        // Start real-time SSE listener for this workspace
+                        let handle = self.start_sse_listener(ws.id.clone(), t.clone());
+                        self.sse_handles.lock().await.push(handle);
                     }
                 }
             }
@@ -276,11 +292,17 @@ impl SyncEngine {
             }
         });
 
-        // Periodic full sync loop
+        // Periodic full sync loop — also wakes immediately on SSE event
         let engine_poll = Arc::clone(&self);
+        let sse_trigger = Arc::clone(&self.sse_trigger);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+                    _ = sse_trigger.notified() => {
+                        eprintln!("[Sync] SSE trigger: running immediate sync");
+                    }
+                }
                 if *engine_poll.paused.read().await {
                     continue;
                 }
@@ -663,6 +685,84 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+}
+
+    /// Spawn an SSE listener task for one workspace. Returns an abort handle.
+    fn start_sse_listener(&self, workspace_id: String, token: String) -> tokio::task::AbortHandle {
+        let paused_arc = Arc::clone(&self.paused);
+        let app = self.app.clone();
+        let sse_trigger = Arc::clone(&self.sse_trigger);
+        let sync_flag = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = tokio::spawn(async move {
+            // SSE client needs a no-timeout HTTP client (separate from the shared one)
+            let sse_client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(0)) // no timeout for SSE
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            let url = format!(
+                "{}/workspaces/{}/events?token={}",
+                api::ws_base(), workspace_id, token
+            );
+
+            let mut backoff_ms = 2_000u64;
+            loop {
+                eprintln!("[SSE] Connecting to workspace {}", workspace_id);
+                match sse_client.get(&url).send().await {
+                    Err(e) => {
+                        eprintln!("[SSE] Connect error: {e}");
+                    }
+                    Ok(resp) if !resp.status().is_success() => {
+                        eprintln!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
+                        return; // 401/403 — don't retry, token is gone
+                    }
+                    Ok(resp) => {
+                        backoff_ms = 2_000; // reset on successful connect
+                        let mut stream = resp.bytes_stream();
+                        let mut buf = String::new();
+                        use futures_util::StreamExt;
+
+                        while let Some(Ok(chunk)) = stream.next().await {
+                            buf.push_str(&String::from_utf8_lossy(&chunk));
+                            while let Some(pos) = buf.find("\n\n") {
+                                let msg = buf[..pos].to_string();
+                                buf = buf[pos + 2..].to_string();
+                                for line in msg.lines() {
+                                    if let Some(data) = line.strip_prefix("data: ") {
+                                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) {
+                                            let kind = ev["type"].as_str().unwrap_or("");
+                                            if kind == "ping" { continue; }
+                                            eprintln!("[SSE] Event: {}", kind);
+                                            // Trigger immediate sync if not already running
+                                            if !*paused_arc.read().await
+                                                && !sync_flag.swap(true, Ordering::SeqCst)
+                                            {
+                                                // Notify the webview
+                                                if let Some(win) = app.get_webview_window("main") {
+                                                    crate::safe_eval(&win, "__HW_SSE_EVENT__", &ev);
+                                                }
+                                                // Small delay to batch rapid successive events
+                                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                                // Wake the poll loop for an immediate sync
+                                                sse_trigger.notify_one();
+                                                sync_flag.store(false, Ordering::SeqCst);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        eprintln!("[SSE] Stream ended for workspace {}", workspace_id);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms * 2).min(60_000);
+            }
+        });
+        handle.abort_handle()
     }
 }
 
