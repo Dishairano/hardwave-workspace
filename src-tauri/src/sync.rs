@@ -686,7 +686,6 @@ impl SyncEngine {
 
         Ok(())
     }
-}
 
     /// Spawn an SSE listener task for one workspace. Returns an abort handle.
     fn start_sse_listener(&self, workspace_id: String, token: String) -> tokio::task::AbortHandle {
