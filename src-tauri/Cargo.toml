@@ -40,6 +40,8 @@ windows = { version = "0.58", features = [
   # Without this the whole callback half of the API silently does not exist.
   "Win32_System_CorrelationVector",
   "Win32_System_IO",
+  # CreateFileW takes a SECURITY_ATTRIBUTES, so it is gated on this too.
+  "Win32_Security",
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

@@ -370,8 +370,9 @@ pub fn run() {
             let open_i = MenuItem::with_id(app, "open", "Open Workspace", true, None::<&str>)?;
             let sync_i = MenuItem::with_id(app, "sync_folder", "Open Sync Folder", true, None::<&str>)?;
             let pause_i = MenuItem::with_id(app, "pause", "Pause Sync", true, None::<&str>)?;
+            let free_i = MenuItem::with_id(app, "free_space", "Free Up Space", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_i, &sync_i, &pause_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_i, &sync_i, &free_i, &pause_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .menu(&menu)
@@ -383,6 +384,26 @@ pub fn run() {
                                 let _ = win.show();
                                 let _ = win.set_focus();
                             }
+                        }
+                        "free_space" => {
+                            // Dehydrating thousands of files is far too slow for
+                            // the menu callback thread.
+                            let app = app.clone();
+                            std::thread::spawn(move || {
+                                let msg = match sync::free_up_space() {
+                                    Ok((0, _)) => "Nothing to free up: every synced file is already a placeholder.".to_string(),
+                                    Ok((n, b)) => format!(
+                                        "Freed {:.2} GB across {} files. They stay in Explorer and download again when opened.",
+                                        b as f64 / 1_073_741_824.0, n),
+                                    Err(e) => format!("Could not free up space: {e}"),
+                                };
+                                eprintln!("[FreeSpace] {msg}");
+                                if let Some(win) = app.get_webview_window("main") {
+                                    let safe: String =
+                                        msg.chars().filter(|c| *c != '\\' && *c != '\'').collect();
+                                    let _ = win.eval(format!("window.__HW_TOAST__ && window.__HW_TOAST__('{}')", safe));
+                                }
+                            });
                         }
                         "sync_folder" => {
                             let root = sync::sync_root();

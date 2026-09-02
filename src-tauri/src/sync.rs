@@ -882,3 +882,57 @@ impl Drop for SyncGuard<'_> {
         self.0.store(false, Ordering::SeqCst);
     }
 }
+
+/// Convert every already-uploaded local file into a dehydrated placeholder.
+///
+/// The OneDrive "Free up space" behaviour. Files stay visible and openable;
+/// only their bytes go, and opening one pulls it back.
+///
+/// Deliberately conservative: a file is only touched when the sync index says
+/// the server holds it AND the local hash still matches what was uploaded. An
+/// unsynced or locally-modified file is skipped, because dehydrating one would
+/// destroy the only copy.
+pub fn free_up_space() -> Result<(u32, u64), String> {
+    if !crate::cloudfiles::is_supported() {
+        return Err("Files On-Demand is not available on this system".into());
+    }
+    let root = sync_root();
+    let index = read_index();
+    let mut freed_files = 0u32;
+    let mut freed_bytes = 0u64;
+    let mut skipped = 0u32;
+
+    for (rel_path, entry) in index.iter() {
+        let path = root.join(rel_path);
+        if !path.is_file() {
+            continue;
+        }
+        // Already dehydrated: nothing to reclaim.
+        if crate::cloudfiles::is_placeholder(&path) {
+            continue;
+        }
+        // Without both halves of the identity we cannot ask the server for the
+        // bytes again, so discarding them locally would lose the file.
+        let (Some(ws_id), Some(file_id)) = (&entry.workspace_id, &entry.remote_id) else {
+            skipped += 1;
+            continue;
+        };
+        // Modified since upload? Leave it: the server copy is stale, so the
+        // local bytes are the only current ones.
+        match hash_file(&path) {
+            Ok(h) if h == entry.sha256 => {}
+            _ => { skipped += 1; continue; }
+        }
+
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        match crate::cloudfiles::dehydrate(&path, &format!("{}/{}", ws_id, file_id)) {
+            Ok(()) => { freed_files += 1; freed_bytes += size; }
+            Err(e) => {
+                eprintln!("[FreeSpace] {rel_path}: {e}");
+                skipped += 1;
+            }
+        }
+    }
+    eprintln!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
+    Ok((freed_files, freed_bytes))
+}

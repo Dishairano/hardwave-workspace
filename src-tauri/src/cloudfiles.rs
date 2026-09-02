@@ -39,6 +39,9 @@ mod imp {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn is_placeholder(_path: &Path) -> bool { false }
+    pub fn dehydrate(_path: &Path, _identity: &str) -> Result<(), String> {
+        Err("Files On-Demand is Windows only".into())
+    }
 }
 
 #[cfg(windows)]
@@ -216,6 +219,55 @@ mod imp {
         Ok(created)
     }
 
+    /// Turn a real file into a dehydrated placeholder, freeing its bytes.
+    ///
+    /// This is what OneDrive's "Free up space" does. The file keeps its name,
+    /// size and place in Explorer; only the data goes. Opening it later pulls
+    /// the bytes back through the usual hydration path.
+    ///
+    /// Only safe for files the server already holds — the identity argument is
+    /// how we assert that, and it is the same `workspaceId/fileId` handle used
+    /// when creating a placeholder from the remote index.
+    pub fn dehydrate(path: &Path, identity: &str) -> Result<(), String> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        let path_w = wide(&path.to_string_lossy());
+        let ident_w = wide(identity);
+
+        // Converting needs write access to the file's metadata.
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_w.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        }
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+
+        // MARK_IN_SYNC asserts the server copy is current, which DEHYDRATE
+        // requires before it will discard the local bytes.
+        let res = unsafe {
+            CfConvertToPlaceholder(
+                handle,
+                Some(ident_w.as_ptr() as *const c_void),
+                (ident_w.len() * 2) as u32,
+                CF_CONVERT_FLAG_MARK_IN_SYNC | CF_CONVERT_FLAG_DEHYDRATE,
+                None,
+                None,
+            )
+        };
+        unsafe { let _ = CloseHandle(handle); }
+        res.map_err(|e| err(e.code(), "CfConvertToPlaceholder"))
+    }
+
     /// Is this path a placeholder we own, rather than a real file? Used to skip
     /// dehydrated files when scanning for local changes — reading one would
     /// hydrate it, which is exactly what we are trying to avoid.
@@ -235,4 +287,4 @@ mod imp {
 }
 
 #[allow(unused_imports)]
-pub use imp::{create_placeholders, is_placeholder, is_supported, register, unregister};
+pub use imp::{create_placeholders, dehydrate, is_placeholder, is_supported, register, unregister};
