@@ -1,3 +1,5 @@
+mod cloudfiles;
+mod hydration;
 mod api;
 mod models;
 mod sync;

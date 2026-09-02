@@ -94,6 +94,13 @@ fn scan_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u
     };
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
+        // A dehydrated placeholder has no local content, and hashing it would
+        // force Windows to download the whole file — exactly what On-Demand is
+        // meant to avoid. Leave those to the remote index.
+        if crate::cloudfiles::is_placeholder(&path) {
+            continue;
+        }
+
         // Skip hidden files and .hardwave-sync metadata
         if path.file_name()
             .and_then(|n| n.to_str())
@@ -240,6 +247,55 @@ impl SyncEngine {
     pub async fn start(self: Arc<Self>) {
         let root = sync_root();
         let _ = std::fs::create_dir_all(&root);
+
+        // Files On-Demand. Claim the sync root and start answering hydration
+        // requests, so placeholders can be created below and opened later.
+        // Every failure here is non-fatal: without it the engine simply
+        // downloads files in full, which is what it did before.
+        if crate::cloudfiles::is_supported() {
+            match crate::cloudfiles::register(&root, "Hardwave Workspace") {
+                Ok(()) => {
+                    let token = Arc::clone(&self.token);
+                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64| {
+                        let token = Arc::clone(&token);
+                        Box::pin(async move {
+                            // identity is "workspaceId/fileId", set when the
+                            // placeholder was created.
+                            let (ws_id, file_id) = identity
+                                .split_once('/')
+                                .ok_or_else(|| format!("bad file identity: {identity}"))?;
+                            let tok = token.read().await.clone()
+                                .ok_or_else(|| "not signed in".to_string())?;
+                            let url = api::get_download_url(&tok, ws_id, file_id).await?;
+
+                            // Ask object storage for just the slice Windows
+                            // wants, so opening one sample does not pull a
+                            // whole pack.
+                            let end = offset + length.saturating_sub(1);
+                            let bytes = api::http_client()
+                                .get(&url)
+                                .header("Range", format!("bytes={}-{}", offset, end))
+                                .send().await
+                                .map_err(|e| format!("hydrate request failed: {e}"))?
+                                .bytes().await
+                                .map_err(|e| format!("hydrate body failed: {e}"))?;
+                            Ok(bytes.to_vec())
+                        })
+                    });
+
+                    match crate::hydration::connect(&root, fetcher) {
+                        Ok(conn) => {
+                            eprintln!("[Sync] Files On-Demand active at {}", root.display());
+                            // Held for the process lifetime; dropping it would
+                            // stop Windows from reaching us for hydration.
+                            std::mem::forget(conn);
+                        }
+                        Err(e) => eprintln!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
+                    }
+                }
+                Err(e) => eprintln!("[Sync] sync-root registration failed: {e} — falling back to full downloads"),
+            }
+        }
 
         // Start file watcher for instant local change detection
         let engine = Arc::clone(&self);
@@ -527,11 +583,44 @@ impl SyncEngine {
                     continue;
                 }
 
-                eprintln!("[Sync] Downloading: {}", rel_path);
                 if let Some(parent) = local_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
 
+                // Files On-Demand: create a placeholder rather than pulling the
+                // bytes down. It shows in Explorer at full size for ~1 KB of
+                // disk, and Windows calls our hydration handler if anything
+                // actually opens it. Falls through to a real download when the
+                // platform does not support it (non-Windows, or pre-1709).
+                if crate::cloudfiles::is_supported() {
+                    let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                    let ph = crate::cloudfiles::RemoteFile {
+                        rel_path: rel_path.clone(),
+                        size: rf.size,
+                        identity: format!("{}/{}", ws.id, rf.id),
+                    };
+                    match crate::cloudfiles::create_placeholders(&root, dir, &[ph]) {
+                        Ok(n) if n > 0 => {
+                            eprintln!("[Sync] Placeholder: {}", rel_path);
+                            downloaded.push(SyncEntry {
+                                rel_path: rel_path.clone(),
+                                // The remote hash is authoritative until the
+                                // file is hydrated and edited locally.
+                                sha256: rf.sha256.clone().unwrap_or_default(),
+                                modified: chrono::Utc::now().to_rfc3339(),
+                                size: rf.size,
+                                remote_id: Some(rf.id.clone()),
+                                workspace_id: Some(ws.id.clone()),
+                            });
+                            self.emit_file_progress(rel_path, "placeholder", 100);
+                            continue;
+                        }
+                        Ok(_) => eprintln!("[Sync] Placeholder skipped for '{}'", rel_path),
+                        Err(e) => eprintln!("[Sync] Placeholder failed for '{}': {} — downloading instead", rel_path, e),
+                    }
+                }
+
+                eprintln!("[Sync] Downloading: {}", rel_path);
                 self.emit_file_progress(rel_path, "download", 0);
                 // Download with retry
                 let dl = api::with_retry({
