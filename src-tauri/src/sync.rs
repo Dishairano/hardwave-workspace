@@ -270,16 +270,32 @@ impl SyncEngine {
 
                             // Ask object storage for just the slice Windows
                             // wants, so opening one sample does not pull a
-                            // whole pack.
+                            // whole pack. Not every backend honours Range, so
+                            // fall back to a whole-object GET rather than
+                            // failing the hydration.
                             let end = offset + length.saturating_sub(1);
-                            let bytes = api::http_client()
+                            let ranged = api::http_client()
                                 .get(&url)
                                 .header("Range", format!("bytes={}-{}", offset, end))
                                 .send().await
-                                .map_err(|e| format!("hydrate request failed: {e}"))?
-                                .bytes().await
+                                .map_err(|e| format!("hydrate request failed: {e}"))?;
+
+                            let status = ranged.status();
+                            if status.as_u16() == 206 {
+                                let b = ranged.bytes().await
+                                    .map_err(|e| format!("hydrate body failed: {e}"))?;
+                                return Ok(b.to_vec());
+                            }
+                            if !status.is_success() {
+                                return Err(format!("hydrate HTTP {status}"));
+                            }
+                            // 200 means the whole object came back; take the
+                            // window Windows actually asked for.
+                            let all = ranged.bytes().await
                                 .map_err(|e| format!("hydrate body failed: {e}"))?;
-                            Ok(bytes.to_vec())
+                            let start = (offset as usize).min(all.len());
+                            let stop = (start + length as usize).min(all.len());
+                            Ok(all[start..stop].to_vec())
                         })
                     });
 

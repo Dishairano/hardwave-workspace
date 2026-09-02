@@ -46,6 +46,25 @@ mod imp {
     /// sync root. A process-wide fetcher keeps the unsafe surface small.
     static FETCHER: OnceLock<Fetcher> = OnceLock::new();
 
+    /// Cloud Filter callbacks arrive on a Windows thread-pool thread, which has
+    /// no Tokio context, so `Handle::try_current()` there always fails and every
+    /// hydration is refused ("The cloud operation was unsuccessful"). Capture a
+    /// handle at connect time, when we are still inside the runtime.
+    static RT: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+    /// Hydration failures are invisible in a GUI app, so mirror them to a file
+    /// next to the app data where they can actually be read.
+    fn log_line(msg: &str) {
+        eprintln!("[Hydration] {msg}");
+        if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+            let p = std::path::Path::new(&dir).join("hardwave-workspace-hydration.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                use std::io::Write;
+                let _ = writeln!(f, "{:?} {}", std::time::SystemTime::now(), msg);
+            }
+        }
+    }
+
     /// Chunk size for feeding data back. Large enough to keep throughput up,
     /// small enough that progress moves visibly on a big sample pack.
     const CHUNK: u64 = 1024 * 1024;
@@ -101,25 +120,25 @@ mod imp {
 
         // The callback thread must return promptly, so the actual work goes to
         // the Tokio runtime and reports back through CfExecute.
-        let handle = tokio::runtime::Handle::try_current();
-        let fut = fetch(identity, offset, length);
-        match handle {
-            Ok(h) => {
-                h.spawn(async move {
-                    match fut.await {
-                        Ok(bytes) => transfer(key, txn, offset, &bytes),
-                        Err(e) => {
-                            eprintln!("[Hydration] fetch failed: {e}");
-                            fail_transfer(key, txn, offset, length);
-                        }
-                    }
-                });
+        let Some(rt) = RT.get() else {
+            log_line("no runtime handle captured; was connect() called from async?");
+            fail_transfer(key, txn, offset, length);
+            return;
+        };
+        log_line(&format!("fetch {identity} offset={offset} len={length}"));
+        let fut = fetch(identity.clone(), offset, length);
+        rt.spawn(async move {
+            match fut.await {
+                Ok(bytes) => {
+                    log_line(&format!("got {} bytes for {identity}", bytes.len()));
+                    transfer(key, txn, offset, &bytes);
+                }
+                Err(e) => {
+                    log_line(&format!("fetch failed for {identity}: {e}"));
+                    fail_transfer(key, txn, offset, length);
+                }
             }
-            Err(_) => {
-                eprintln!("[Hydration] no Tokio runtime on callback thread");
-                fail_transfer(key, txn, offset, length);
-            }
-        }
+        });
     }
 
     /// Feed bytes back to the platform in chunks.
@@ -146,7 +165,7 @@ mod imp {
                 op.TransferKey = txn;
 
                 if let Err(e) = CfExecute(&op, &mut params) {
-                    eprintln!("[Hydration] CfExecute failed at offset {}: {:?}", offset + sent, e);
+                    log_line(&format!("CfExecute failed at offset {}: {e:?}", offset + sent));
                     return;
                 }
             }
@@ -178,6 +197,9 @@ mod imp {
     /// Start serving hydration requests for a sync root.
     pub fn connect(root: &Path, fetcher: Fetcher) -> Result<Connection, String> {
         let _ = FETCHER.set(fetcher);
+        // connect() is called from inside the async sync loop, so a handle is
+        // available here even though it will not be in the callback.
+        let _ = RT.set(tokio::runtime::Handle::current());
 
         let callbacks = [
             CF_CALLBACK_REGISTRATION {
