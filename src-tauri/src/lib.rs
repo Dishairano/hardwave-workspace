@@ -371,8 +371,9 @@ pub fn run() {
             let sync_i = MenuItem::with_id(app, "sync_folder", "Open Sync Folder", true, None::<&str>)?;
             let pause_i = MenuItem::with_id(app, "pause", "Pause Sync", true, None::<&str>)?;
             let free_i = MenuItem::with_id(app, "free_space", "Free Up Space", true, None::<&str>)?;
+            let move_i = MenuItem::with_id(app, "move_folder", "Move Folder to Cloud…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_i, &sync_i, &free_i, &pause_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&open_i, &sync_i, &free_i, &move_i, &pause_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .menu(&menu)
@@ -384,6 +385,53 @@ pub fn run() {
                                 let _ = win.show();
                                 let _ = win.set_focus();
                             }
+                        }
+                        "move_folder" => {
+                            // Uploads a folder then deletes the local copies, so
+                            // the choice of folder must be deliberate: native
+                            // picker, and a summary of what it will do.
+                            let app = app.clone();
+                            std::thread::spawn(move || {
+                                use tauri_plugin_dialog::DialogExt;
+                                let Some(dir) = app.dialog().file().blocking_pick_folder() else { return };
+                                let Ok(path) = dir.into_path() else { return };
+
+                                let ok = app.dialog()
+                                    .message(format!(
+                                        "Upload everything in\n{}\nto your workspace, then delete the local copies to free space?\n\nFiles are only deleted after the server confirms it has them.",
+                                        path.display()
+                                    ))
+                                    .title("Move folder to cloud")
+                                    .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                                        "Move and free space".into(), "Cancel".into()))
+                                    .blocking_show();
+                                if !ok { return; }
+
+                                let rt = tokio::runtime::Handle::current();
+                                let engine = rt.block_on(async {
+                                    app.state::<AppState>().sync_engine.lock().await.clone()
+                                });
+                                let Some(engine) = engine else {
+                                    app.dialog().message("Sign in first, then try again.")
+                                        .title("Move folder to cloud").blocking_show();
+                                    return;
+                                };
+                                let res = rt.block_on(sync::archive_folder(engine, path));
+                                let msg = match res {
+                                    Ok(r) if r.moved == 0 =>
+                                        format!("Nothing was moved. {} file(s) could not be uploaded.", r.skipped),
+                                    Ok(r) => format!(
+                                        "Moved {} file(s) into \"{}\" and freed {:.2} GB.{}",
+                                        r.moved, r.workspace, r.bytes_freed as f64 / 1_073_741_824.0,
+                                        if r.skipped > 0 {
+                                            format!(" {} skipped and left on your PC.", r.skipped)
+                                        } else { String::new() }
+                                    ),
+                                    Err(e) => format!("Could not move the folder: {e}"),
+                                };
+                                eprintln!("[Archive] {msg}");
+                                app.dialog().message(msg).title("Move folder to cloud").blocking_show();
+                            });
                         }
                         "free_space" => {
                             // Dehydrating thousands of files is far too slow for

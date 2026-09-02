@@ -957,3 +957,169 @@ pub fn free_up_space() -> Result<(u32, u64), String> {
     eprintln!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
     Ok((freed_files, freed_bytes))
 }
+
+/// Result of moving a local folder into the cloud.
+#[derive(Clone, serde::Serialize)]
+pub struct ArchiveReport {
+    pub moved: u32,
+    pub bytes_freed: u64,
+    pub skipped: u32,
+    pub workspace: String,
+    pub errors: Vec<String>,
+}
+
+/// Upload every file under `src` to a workspace and delete the local copy,
+/// freeing the space it occupied.
+///
+/// Deleting someone's only copy is the worst thing this app could do, so a file
+/// is removed only after `register_upload` returns Ok — and the server calls
+/// `objectExists()` before it will mark a file ready, so that is a real
+/// guarantee the bytes are in object storage, not just that we sent them.
+///
+/// Files are deleted one at a time rather than in a batch at the end: someone
+/// doing this has run out of disk, and space needs to come back as it goes.
+pub async fn archive_folder(
+    engine: Arc<SyncEngine>,
+    src: PathBuf,
+) -> Result<ArchiveReport, String> {
+    let token = engine
+        .token
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "Not signed in".to_string())?;
+
+    // Moving the sync folder into itself would upload placeholders and delete
+    // the originals.
+    let root = sync_root();
+    if src == root || src.starts_with(&root) {
+        return Err("That folder is already synced. Use Free Up Space instead.".into());
+    }
+    // A home directory or a drive root is never a deliberate choice here.
+    if src.parent().is_none() || dirs::home_dir().map(|h| h == src).unwrap_or(false) {
+        return Err("Refusing to move an entire drive or home folder.".into());
+    }
+
+    let mut workspaces = api::list_workspaces(&token).await?;
+    if workspaces.is_empty() {
+        return Err("No workspace to move files into".into());
+    }
+    let ws = workspaces.remove(0);
+
+    let base = src
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Archived".into());
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(&src, &mut files);
+
+    let total = files.len();
+    let mut report = ArchiveReport {
+        moved: 0,
+        bytes_freed: 0,
+        skipped: 0,
+        workspace: ws.name.clone(),
+        errors: Vec::new(),
+    };
+
+    for (i, path) in files.iter().enumerate() {
+        let name = match path.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => { report.skipped += 1; continue; }
+        };
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+
+        // Mirror the local tree under a folder named after the source.
+        let rel_dir = path
+            .parent()
+            .and_then(|p| p.strip_prefix(&src).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let folder_path = if rel_dir.is_empty() {
+            base.clone()
+        } else {
+            format!("{}/{}", base, rel_dir)
+        };
+
+        let _ = engine.app.emit(
+            "archive-progress",
+            serde_json::json!({ "current": i + 1, "total": total, "name": name }),
+        );
+
+        let sha = match hash_file(path) {
+            Ok(h) => h,
+            Err(e) => {
+                report.skipped += 1;
+                report.errors.push(format!("{name}: unreadable ({e})"));
+                continue;
+            }
+        };
+
+        let outcome = async {
+            let up = api::init_upload(&token, &ws.id, &name, size, Some(&folder_path), &sha).await?;
+            api::upload_to_s3(&up.upload_url, path).await?;
+            // Only returns Ok once the server has confirmed the object exists.
+            api::register_upload(&token, &ws.id, &up.file_id).await?;
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match outcome {
+            Ok(()) => match std::fs::remove_file(path) {
+                Ok(()) => {
+                    report.moved += 1;
+                    report.bytes_freed += size;
+                }
+                Err(e) => {
+                    // Safely in the cloud, just not removed here. Not a failure.
+                    report.errors.push(format!("{name}: uploaded but not deleted ({e})"));
+                }
+            },
+            Err(e) => {
+                report.skipped += 1;
+                report.errors.push(format!("{name}: {e}"));
+            }
+        }
+    }
+
+    // Tidy up directories we emptied. remove_dir only succeeds on an empty one,
+    // so anything still holding a skipped file is left alone.
+    prune_empty_dirs(&src);
+
+    eprintln!(
+        "[Archive] {} files moved to '{}', {} bytes freed, {} skipped",
+        report.moved, report.workspace, report.bytes_freed, report.skipped
+    );
+    Ok(report)
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else if p.is_file() {
+            let hidden = p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false);
+            if !hidden {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Remove empty directories depth-first, including `dir` itself if it ends up empty.
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            prune_empty_dirs(&p);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
