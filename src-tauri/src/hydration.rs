@@ -210,4 +210,5 @@ mod imp {
     }
 }
 
+#[allow(unused_imports)]
 pub use imp::{connect, disconnect, Connection};

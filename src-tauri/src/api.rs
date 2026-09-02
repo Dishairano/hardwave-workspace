@@ -1,5 +1,5 @@
 use crate::models::AuthResponse;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -104,6 +104,7 @@ pub struct Workspace {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // mirrors the API payload
 pub struct WorkspaceFile {
     #[serde(deserialize_with = "id_from_json")]
     pub id: String,
@@ -175,6 +176,7 @@ pub async fn list_files(token: &str, workspace_id: &str) -> Result<Vec<Workspace
 
 /// A folder in a workspace.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // mirrors the API payload; not every field is consumed yet
 pub struct WorkspaceFolder {
     #[serde(deserialize_with = "id_from_json")]
     pub id: String,

@@ -23,7 +23,7 @@ pub struct AppState {
 /// Embeds JSON directly as a JS expression (valid JSON is valid JS).
 pub fn safe_eval<T: serde::Serialize>(win: &WebviewWindow, fn_name: &str, data: &T) {
     let Ok(json) = serde_json::to_string(data) else { return };
-    let fn_safe = fn_name.replace('\'', "").replace('\\', "");
+    let fn_safe: String = fn_name.chars().filter(|c| *c != '\'' && *c != '\\').collect();
     let js = format!(
         "try{{window['{}'] && window['{}']({})}}catch(e){{}}",
         fn_safe, fn_safe, json
@@ -212,7 +212,7 @@ async fn download_file(
         let chunk = chunk.map_err(|e| format!("Download stream error: {}", e))?;
         file.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
-        let pct = if total > 0 { downloaded * 100 / total } else { 0 };
+        let pct = (downloaded * 100).checked_div(total).unwrap_or(0);
         if pct != last_pct {
             last_pct = pct;
             if let Some(win) = app.get_webview_window("main") {
@@ -342,7 +342,7 @@ async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
         move |downloaded, total| {
             let pct = total.map(|t| (downloaded as f64 / t as f64 * 100.0) as u32).unwrap_or(0);
             if let Some(win) = h.get_webview_window("main") {
-                let _ = win.eval(&format!("window.__HW_UPDATE_PROGRESS__ = {};", pct));
+                let _ = win.eval(format!("window.__HW_UPDATE_PROGRESS__ = {};", pct));
             }
         },
         || {},

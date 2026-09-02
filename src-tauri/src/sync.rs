@@ -5,7 +5,7 @@
 
 use crate::api;
 use crate::models::{SyncEntry, SyncStatus};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind};
+use notify::{RecursiveMode, Watcher, Event, EventKind};
 use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::io::Read;
@@ -286,9 +286,13 @@ impl SyncEngine {
                     match crate::hydration::connect(&root, fetcher) {
                         Ok(conn) => {
                             eprintln!("[Sync] Files On-Demand active at {}", root.display());
-                            // Held for the process lifetime; dropping it would
-                            // stop Windows from reaching us for hydration.
-                            std::mem::forget(conn);
+                            // The OS connection lives until CfDisconnectSyncRoot
+                            // is called, which we never do while running. Park the
+                            // handle rather than dropping it so a future clean
+                            // shutdown has something to close.
+                            static HYDRATION: std::sync::OnceLock<crate::hydration::Connection> =
+                                std::sync::OnceLock::new();
+                            let _ = HYDRATION.set(conn);
                         }
                         Err(e) => eprintln!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
                     }
@@ -298,7 +302,7 @@ impl SyncEngine {
         }
 
         // Start file watcher for instant local change detection
-        let engine = Arc::clone(&self);
+        let _engine = Arc::clone(&self);
         let (fs_tx, mut fs_rx) = mpsc::channel::<String>(256);
 
         let watch_root = root.clone();
@@ -497,7 +501,7 @@ impl SyncEngine {
             status.error = None;
         } else {
             status.state = "error".into();
-            status.error = Some(result.as_ref().unwrap_err().clone());
+            status.error = result.as_ref().err().cloned();
         }
         let _ = self.app.emit("sync:status", status.clone());
 
@@ -562,7 +566,7 @@ impl SyncEngine {
             // Process downloads without holding the index lock
             let mut downloaded: Vec<SyncEntry> = Vec::new();
             for (rel_path, rf) in &to_download {
-                let local_path = root.join(&rel_path);
+                let local_path = root.join(rel_path);
 
                 // Conflict: file exists locally but not indexed
                 if local_path.exists() {

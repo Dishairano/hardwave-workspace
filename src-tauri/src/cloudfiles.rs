@@ -97,9 +97,9 @@ mod imp {
         let policies = CF_SYNC_POLICIES {
             StructSize: size_of::<CF_SYNC_POLICIES>() as u32,
             Hydration: CF_HYDRATION_POLICY {
-                Primary: CF_HYDRATION_POLICY_PRIMARY(CF_HYDRATION_POLICY_FULL.0 as u16),
+                Primary: CF_HYDRATION_POLICY_PRIMARY(CF_HYDRATION_POLICY_FULL.0),
                 Modifier: CF_HYDRATION_POLICY_MODIFIER(
-                    CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED.0 as u16,
+                    CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED.0,
                 ),
             },
             // ALWAYS_FULL, not FULL. We enumerate the entire remote index and
@@ -113,7 +113,7 @@ mod imp {
             // open sat waiting for the timeout. ALWAYS_FULL tells the platform
             // never to forward enumeration at all.
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0 as u16),
+                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0),
                 Modifier: CF_POPULATION_POLICY_MODIFIER(0),
             },
             InSync: CF_INSYNC_POLICY_TRACK_ALL,
@@ -234,4 +234,5 @@ mod imp {
     }
 }
 
+#[allow(unused_imports)]
 pub use imp::{create_placeholders, is_placeholder, is_supported, register, unregister};
