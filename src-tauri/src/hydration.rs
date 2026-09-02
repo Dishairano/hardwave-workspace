@@ -195,7 +195,7 @@ mod imp {
         let key = unsafe {
             CfConnectSyncRoot(
                 PCWSTR(root_w.as_ptr()),
-                &callbacks,
+                callbacks.as_ptr(),
                 None,
                 CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
             )
