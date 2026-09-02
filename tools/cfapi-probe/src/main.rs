@@ -31,10 +31,9 @@ fn main() {
     println!("=================================\n");
 
     // 1. Platform support. Anything below Windows 10 1709 has no cfapi at all.
-    let mut info = CF_PLATFORM_INFO::default();
-    let hr = unsafe { CfGetPlatformInfo(&mut info) };
-    match hr {
-        Ok(()) => println!(
+    // The windows crate returns the struct rather than filling an out-param.
+    match unsafe { CfGetPlatformInfo() } {
+        Ok(info) => println!(
             "platform     : build {}.{} (integration 0x{:X})",
             info.BuildNumber, info.RevisionNumber, info.IntegrationNumber
         ),
