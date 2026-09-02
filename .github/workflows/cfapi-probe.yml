@@ -1,0 +1,35 @@
+name: cfapi probe
+
+# Manual only. Builds the Cloud Filter API feasibility probe on a real Windows
+# runner and uploads the exe as an artefact, so we can answer the packaging
+# question on a real machine before committing to Files On-Demand.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tools/cfapi-probe/target
+          key: cfapi-probe-${{ hashFiles('tools/cfapi-probe/Cargo.toml') }}
+
+      - name: Build probe
+        working-directory: tools/cfapi-probe
+        run: cargo build --release
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfapi-probe
+          path: tools/cfapi-probe/target/release/cfapi-probe.exe
+          if-no-files-found: error
