@@ -707,7 +707,28 @@ impl SyncEngine {
                 let idx = self.index.lock().await;
                 local_files.iter().filter_map(|(local_rel, local_path, size)| {
                     let full_rel = format!("{}/{}", ws.name, local_rel);
-                    if idx.contains_key(&full_rel) { return None; }
+                    // Presence in the index used to be enough to skip a file, so
+                    // editing something that had already synced never uploaded
+                    // again: open a project from the workspace, save it, and the
+                    // server kept the old version forever. Compare contents.
+                    //
+                    // Size is checked first because it is free; the hash only
+                    // runs when the size matches, which is the common case.
+                    if let Some(entry) = idx.get(&full_rel) {
+                        if entry.size == *size {
+                            match hash_file(local_path) {
+                                Ok(h) if h == entry.sha256 => return None, // unchanged
+                                Ok(h) => {
+                                    eprintln!("[Sync] Modified, re-uploading: {}", full_rel);
+                                    return Some((full_rel, local_path.clone(), *size, h));
+                                }
+                                // Unreadable (locked by the DAW, say). Leave it
+                                // for the next pass rather than uploading junk.
+                                Err(_) => return None,
+                            }
+                        }
+                        eprintln!("[Sync] Size changed, re-uploading: {}", full_rel);
+                    }
                     let sha = hash_file(local_path).ok()?;
                     Some((full_rel, local_path.clone(), *size, sha))
                 }).collect()
