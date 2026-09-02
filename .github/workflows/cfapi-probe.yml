@@ -33,3 +33,22 @@ jobs:
           name: cfapi-probe
           path: tools/cfapi-probe/target/release/cfapi-probe.exe
           if-no-files-found: error
+
+  # Typecheck the real app's Windows-only code. Cheaper than a full Tauri
+  # bundle and catches the FFI mistakes, which is what we actually need.
+  check-app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: app-check-${{ hashFiles('src-tauri/Cargo.toml') }}
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --lib 2>&1
