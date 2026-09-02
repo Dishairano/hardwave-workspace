@@ -27,8 +27,17 @@ pub fn http_client() -> &'static reqwest::Client {
 }
 
 /// API base URLs — override via HW_API_BASE and HW_WS_API_BASE env vars at build time.
-const BASE_URL: &str = option_env!("HW_API_BASE").unwrap_or("https://hardwavestudios.com/api");
-const WS_BASE: &str = option_env!("HW_WS_API_BASE").unwrap_or("https://workspace.hardwavestudios.com/api");
+// `Option::unwrap_or` is not const-stable, so this cannot run in a const
+// initialiser on current toolchains (it compiled on the April 2026 Rust and
+// broke afterwards). `match` is const-callable and does the same job.
+const BASE_URL: &str = match option_env!("HW_API_BASE") {
+    Some(v) => v,
+    None => "https://hardwavestudios.com/api",
+};
+const WS_BASE: &str = match option_env!("HW_WS_API_BASE") {
+    Some(v) => v,
+    None => "https://workspace.hardwavestudios.com/api",
+};
 
 /// Expose WS_BASE for SSE URL construction in other modules.
 pub fn ws_base() -> &'static str { WS_BASE }

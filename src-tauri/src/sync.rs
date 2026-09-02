@@ -732,6 +732,7 @@ impl SyncEngine {
                                 let folder = folder.clone();
                                 let sha = sha.clone();
                                 let local_path = local_path.clone();
+                                let full_rel = full_rel.clone();
                                 Box::pin(async move {
                                     let up = api::init_upload(&token, &ws_id, &filename, size, folder.as_deref(), &sha).await?;
                                     api::upload_to_s3(&up.upload_url, &local_path).await?;

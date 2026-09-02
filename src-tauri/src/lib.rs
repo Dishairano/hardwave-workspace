@@ -251,8 +251,10 @@ async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
-async fn get_auto_sync(state: State<'_, AppState>) -> bool {
-    *state.auto_sync.lock().await
+async fn get_auto_sync(state: State<'_, AppState>) -> Result<bool, String> {
+    // Tauri requires async commands with borrowed inputs to return a Result;
+    // the frontend still receives the plain value on success.
+    Ok(*state.auto_sync.lock().await)
 }
 
 fn load_auto_sync_pref() -> bool {

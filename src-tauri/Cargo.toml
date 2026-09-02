@@ -35,6 +35,11 @@ windows = { version = "0.58", features = [
   "Win32_Storage_CloudFilters",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
+  # CF_CALLBACK_INFO and CF_OPERATION_INFO both carry a *mut CORRELATION_VECTOR,
+  # and windows-rs only emits an item when every namespace it touches is enabled.
+  # Without this the whole callback half of the API silently does not exist.
+  "Win32_System_CorrelationVector",
+  "Win32_System_IO",
 ] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

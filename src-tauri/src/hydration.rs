@@ -38,6 +38,7 @@ mod imp {
     use std::sync::OnceLock;
 
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::NTSTATUS;
     use windows::Win32::Storage::CloudFilters::*;
 
     /// Windows hands callbacks a raw context pointer, but wiring a per-root
@@ -122,30 +123,32 @@ mod imp {
     }
 
     /// Feed bytes back to the platform in chunks.
-    fn transfer(key: CF_CONNECTION_KEY, txn: CF_TRANSFER_KEY, offset: u64, data: &[u8]) {
+    fn transfer(key: CF_CONNECTION_KEY, txn: i64, offset: u64, data: &[u8]) {
         let mut sent: u64 = 0;
         let total = data.len() as u64;
         while sent < total {
             let n = CHUNK.min(total - sent);
-            let mut params = CF_OPERATION_PARAMETERS::default();
-            params.ParamSize = size_of::<CF_OPERATION_PARAMETERS>() as u32;
-            params.Anonymous.TransferData = CF_OPERATION_PARAMETERS_0_6 {
-                Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-                CompletionStatus: windows::Win32::Foundation::STATUS_SUCCESS,
-                Buffer: unsafe { data.as_ptr().add(sent as usize) } as *const c_void,
-                Offset: (offset + sent) as i64,
-                Length: n as i64,
-            };
+            unsafe {
+                // Zero and assign rather than naming the generated union
+                // variant: those names are positional and move between
+                // windows-rs releases.
+                let mut params: CF_OPERATION_PARAMETERS = std::mem::zeroed();
+                params.ParamSize = size_of::<CF_OPERATION_PARAMETERS>() as u32;
+                params.Anonymous.TransferData.CompletionStatus = NTSTATUS(0); // STATUS_SUCCESS
+                params.Anonymous.TransferData.Buffer = data.as_ptr().add(sent as usize) as *const c_void;
+                params.Anonymous.TransferData.Offset = (offset + sent) as i64;
+                params.Anonymous.TransferData.Length = n as i64;
 
-            let mut op = CF_OPERATION_INFO::default();
-            op.StructSize = size_of::<CF_OPERATION_INFO>() as u32;
-            op.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
-            op.ConnectionKey = key;
-            op.TransferKey = txn;
+                let mut op: CF_OPERATION_INFO = std::mem::zeroed();
+                op.StructSize = size_of::<CF_OPERATION_INFO>() as u32;
+                op.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
+                op.ConnectionKey = key;
+                op.TransferKey = txn;
 
-            if let Err(e) = unsafe { CfExecute(&op, &mut params) } {
-                eprintln!("[Hydration] CfExecute failed at offset {}: {:?}", offset + sent, e);
-                return;
+                if let Err(e) = CfExecute(&op, &mut params) {
+                    eprintln!("[Hydration] CfExecute failed at offset {}: {:?}", offset + sent, e);
+                    return;
+                }
             }
             sent += n;
         }
@@ -153,22 +156,23 @@ mod imp {
 
     /// Tell the platform we could not produce the data, so the reading app gets
     /// a clean error instead of hanging.
-    fn fail_transfer(key: CF_CONNECTION_KEY, txn: CF_TRANSFER_KEY, offset: u64, length: u64) {
-        let mut params = CF_OPERATION_PARAMETERS::default();
-        params.ParamSize = size_of::<CF_OPERATION_PARAMETERS>() as u32;
-        params.Anonymous.TransferData = CF_OPERATION_PARAMETERS_0_6 {
-            Flags: CF_OPERATION_TRANSFER_DATA_FLAG_NONE,
-            CompletionStatus: windows::Win32::Foundation::STATUS_UNSUCCESSFUL,
-            Buffer: std::ptr::null(),
-            Offset: offset as i64,
-            Length: length as i64,
-        };
-        let mut op = CF_OPERATION_INFO::default();
-        op.StructSize = size_of::<CF_OPERATION_INFO>() as u32;
-        op.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
-        op.ConnectionKey = key;
-        op.TransferKey = txn;
-        let _ = unsafe { CfExecute(&op, &mut params) };
+    fn fail_transfer(key: CF_CONNECTION_KEY, txn: i64, offset: u64, length: u64) {
+        unsafe {
+            let mut params: CF_OPERATION_PARAMETERS = std::mem::zeroed();
+            params.ParamSize = size_of::<CF_OPERATION_PARAMETERS>() as u32;
+            // STATUS_UNSUCCESSFUL
+            params.Anonymous.TransferData.CompletionStatus = NTSTATUS(0xC000_0001u32 as i32);
+            params.Anonymous.TransferData.Buffer = std::ptr::null();
+            params.Anonymous.TransferData.Offset = offset as i64;
+            params.Anonymous.TransferData.Length = length as i64;
+
+            let mut op: CF_OPERATION_INFO = std::mem::zeroed();
+            op.StructSize = size_of::<CF_OPERATION_INFO>() as u32;
+            op.Type = CF_OPERATION_TYPE_TRANSFER_DATA;
+            op.ConnectionKey = key;
+            op.TransferKey = txn;
+            let _ = CfExecute(&op, &mut params);
+        }
     }
 
     /// Start serving hydration requests for a sync root.
