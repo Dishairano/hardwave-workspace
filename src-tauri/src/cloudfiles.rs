@@ -102,11 +102,18 @@ mod imp {
                     CF_HYDRATION_POLICY_MODIFIER_AUTO_DEHYDRATION_ALLOWED.0 as u16,
                 ),
             },
-            // FULL population: when Explorer opens a directory we hand back every
-            // entry at once. Our file lists are small, so partial enumeration
-            // would add round-trips for no benefit.
+            // ALWAYS_FULL, not FULL. We enumerate the entire remote index and
+            // create every placeholder up front, so the namespace really is
+            // always present locally.
+            //
+            // FULL was wrong and made Explorer painfully slow: it tells the
+            // platform to ask the provider to enumerate any directory it thinks
+            // is incomplete, via a FETCH_PLACEHOLDERS callback we never
+            // registered. Explorer asked, nothing answered, and every folder
+            // open sat waiting for the timeout. ALWAYS_FULL tells the platform
+            // never to forward enumeration at all.
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_FULL.0 as u16),
+                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0 as u16),
                 Modifier: CF_POPULATION_POLICY_MODIFIER(0),
             },
             InSync: CF_INSYNC_POLICY_TRACK_ALL,
@@ -119,7 +126,7 @@ mod imp {
                 PCWSTR(root_w.as_ptr()),
                 &registration,
                 &policies,
-                CF_REGISTER_FLAG_UPDATE,
+                CF_REGISTER_FLAG_UPDATE | CF_REGISTER_FLAG_MARK_IN_SYNC_ON_ROOT,
             )
         }
         .map_err(|e| err(e.code(), "CfRegisterSyncRoot"))

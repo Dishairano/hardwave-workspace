@@ -457,6 +457,17 @@ pub fn run() {
             sync_engine: TokioMutex::new(None),
             auto_sync: TokioMutex::new(load_auto_sync_pref()),
         })
+        // Closing the window must not quit the app. The process IS the cloud
+        // provider: quitting disconnects it, so sync stops and — worse — every
+        // placeholder in Explorer becomes unopenable, because nothing is left
+        // to answer the hydration callback. Hide to the tray instead; Quit in
+        // the tray menu is the deliberate way out.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             login,
             logout,
