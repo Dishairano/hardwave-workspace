@@ -96,7 +96,7 @@ pub async fn get_auth_status(token: &str) -> Result<bool, String> {
     Ok(res.status().is_success())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Workspace {
     #[serde(deserialize_with = "id_from_json")]
     pub id: String,

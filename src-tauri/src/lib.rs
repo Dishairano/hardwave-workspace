@@ -250,6 +250,43 @@ async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(
     Ok(())
 }
 
+/// Open a native folder picker and return the chosen path.
+/// Separate from starting the move so the UI can show what was picked and let
+/// the user choose a destination before anything is uploaded or deleted.
+#[tauri::command]
+async fn archive_pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    // A std::sync::mpsc recv() here blocks the async executor thread that also
+    // has to pump the dialog, so the picker never appeared at all. A oneshot we
+    // await yields instead of blocking.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().pick_folder(move |p| { let _ = tx.send(p); });
+    let picked = rx.await.map_err(|e| e.to_string())?;
+    Ok(picked.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()))
+}
+
+/// Workspaces the signed-in user can move files into.
+#[tauri::command]
+async fn archive_workspaces(state: State<'_, AppState>) -> Result<Vec<api::Workspace>, String> {
+    let token = state.api_token.lock().await.clone()
+        .ok_or_else(|| "Not signed in".to_string())?;
+    api::list_workspaces(&token).await
+}
+
+/// Upload a folder then delete the local copies. Progress arrives as
+/// `archive-progress` events; the report comes back when it finishes.
+#[tauri::command]
+async fn archive_start(
+    state: State<'_, AppState>,
+    path: String,
+    workspace_id: Option<String>,
+    dest_folder: Option<String>,
+) -> Result<sync::ArchiveReport, String> {
+    let engine = state.sync_engine.lock().await.clone()
+        .ok_or_else(|| "Sign in first".to_string())?;
+    sync::archive_folder(engine, std::path::PathBuf::from(path), workspace_id, dest_folder).await
+}
+
 #[tauri::command]
 async fn get_auto_sync(state: State<'_, AppState>) -> Result<bool, String> {
     // Tauri requires async commands with borrowed inputs to return a Result;
@@ -376,8 +413,14 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&open_i, &sync_i, &free_i, &move_i, &pause_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
+                // Without an icon the tray shows a nameless blank entry that is
+                // almost impossible to find among the others.
+                .icon(app.default_window_icon().cloned().ok_or("no window icon")?)
                 .menu(&menu)
                 .tooltip("Hardwave Workspace")
+                // Left-click should open the app, the way every other tray app
+                // behaves; the menu stays on right-click.
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
                         "open" => {
@@ -387,51 +430,13 @@ pub fn run() {
                             }
                         }
                         "move_folder" => {
-                            // Uploads a folder then deletes the local copies, so
-                            // the choice of folder must be deliberate: native
-                            // picker, and a summary of what it will do.
-                            let app = app.clone();
-                            std::thread::spawn(move || {
-                                use tauri_plugin_dialog::DialogExt;
-                                let Some(dir) = app.dialog().file().blocking_pick_folder() else { return };
-                                let Ok(path) = dir.into_path() else { return };
-
-                                let ok = app.dialog()
-                                    .message(format!(
-                                        "Upload everything in\n{}\nto your workspace, then delete the local copies to free space?\n\nFiles are only deleted after the server confirms it has them.",
-                                        path.display()
-                                    ))
-                                    .title("Move folder to cloud")
-                                    .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                                        "Move and free space".into(), "Cancel".into()))
-                                    .blocking_show();
-                                if !ok { return; }
-
-                                let rt = tokio::runtime::Handle::current();
-                                let engine = rt.block_on(async {
-                                    app.state::<AppState>().sync_engine.lock().await.clone()
-                                });
-                                let Some(engine) = engine else {
-                                    app.dialog().message("Sign in first, then try again.")
-                                        .title("Move folder to cloud").blocking_show();
-                                    return;
-                                };
-                                let res = rt.block_on(sync::archive_folder(engine, path));
-                                let msg = match res {
-                                    Ok(r) if r.moved == 0 =>
-                                        format!("Nothing was moved. {} file(s) could not be uploaded.", r.skipped),
-                                    Ok(r) => format!(
-                                        "Moved {} file(s) into \"{}\" and freed {:.2} GB.{}",
-                                        r.moved, r.workspace, r.bytes_freed as f64 / 1_073_741_824.0,
-                                        if r.skipped > 0 {
-                                            format!(" {} skipped and left on your PC.", r.skipped)
-                                        } else { String::new() }
-                                    ),
-                                    Err(e) => format!("Could not move the folder: {e}"),
-                                };
-                                eprintln!("[Archive] {msg}");
-                                app.dialog().message(msg).title("Move folder to cloud").blocking_show();
-                            });
+                            // The destination matters, so this opens the app
+                            // rather than guessing a workspace from the tray.
+                            if let Some(win) = app.get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                                let _ = win.eval("window.__HW_OPEN_ARCHIVE__ && window.__HW_OPEN_ARCHIVE__()");
+                            }
                         }
                         "free_space" => {
                             // Dehydrating thousands of files is far too slow for
@@ -551,6 +556,9 @@ pub fn run() {
             install_update,
             toggle_auto_sync,
             get_auto_sync,
+            archive_pick_folder,
+            archive_workspaces,
+            archive_start,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hardwave Workspace");

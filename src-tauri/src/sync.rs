@@ -981,6 +981,8 @@ pub struct ArchiveReport {
 pub async fn archive_folder(
     engine: Arc<SyncEngine>,
     src: PathBuf,
+    workspace_id: Option<String>,
+    dest_folder: Option<String>,
 ) -> Result<ArchiveReport, String> {
     let token = engine
         .token
@@ -1004,12 +1006,24 @@ pub async fn archive_folder(
     if workspaces.is_empty() {
         return Err("No workspace to move files into".into());
     }
-    let ws = workspaces.remove(0);
+    let ws = match &workspace_id {
+        Some(id) => workspaces
+            .iter()
+            .find(|w| &w.id == id)
+            .cloned()
+            .ok_or_else(|| format!("Workspace {id} not found"))?,
+        None => workspaces.remove(0),
+    };
 
-    let base = src
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "Archived".into());
+    // Where the files land inside that workspace. Defaults to a folder named
+    // after the one being moved.
+    let base = match dest_folder.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => d.trim_matches('/').to_string(),
+        None => src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Archived".into()),
+    };
 
     let mut files: Vec<PathBuf> = Vec::new();
     collect_files(&src, &mut files);
