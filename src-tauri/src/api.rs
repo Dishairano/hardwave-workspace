@@ -234,7 +234,11 @@ pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) ->
 pub struct UploadInitResponse {
     #[serde(alias = "uploadUrl")]
     pub upload_url: String,
-    #[serde(alias = "fileId")]
+    /// The API returns this twice for compatibility: `fileId` as a number and
+    /// `file_id` as a string. The alias means serde meets the number first and
+    /// fails to put it in a String, which reqwest surfaces only as the useless
+    /// "error decoding response body". Coerce either form.
+    #[serde(alias = "fileId", deserialize_with = "id_from_json")]
     pub file_id: String,
 }
 
@@ -268,9 +272,14 @@ pub async fn init_upload(
         return Err(format!("Upload init error: {}", err));
     }
 
-    res.json::<UploadInitResponse>()
-        .await
-        .map_err(|e| format!("Parse error: {}", e))
+    // Read the text first: reqwest's .json() hides the serde detail behind
+    // "error decoding response body", which says nothing about which field
+    // was wrong.
+    let body = res.text().await.map_err(|e| format!("Upload init read failed: {e}"))?;
+    serde_json::from_str::<UploadInitResponse>(&body).map_err(|e| {
+        format!("Upload init returned an unexpected reply ({e}): {}",
+                body.chars().take(200).collect::<String>())
+    })
 }
 
 /// Confirm upload completion.

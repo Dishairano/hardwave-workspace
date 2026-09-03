@@ -1108,20 +1108,43 @@ pub async fn archive_folder(
     Ok(report)
 }
 
+/// True for files the user is not shown in Explorer and did not choose to move:
+/// Windows marks album art and desktop.ini as Hidden or System attributes rather
+/// than by name, so a leading-dot check (a Unix convention) missed them. A folder
+/// showing three files was reporting five failures because of exactly this.
+fn is_hidden(path: &Path) -> bool {
+    if path
+        .file_name()
+        .map(|n| n.to_string_lossy().starts_with('.'))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+        if let Ok(md) = path.metadata() {
+            let a = md.file_attributes();
+            if a & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
-            collect_files(&p, out);
-        } else if p.is_file() {
-            let hidden = p
-                .file_name()
-                .map(|n| n.to_string_lossy().starts_with('.'))
-                .unwrap_or(false);
-            if !hidden {
-                out.push(p);
+            if !is_hidden(&p) {
+                collect_files(&p, out);
             }
+        } else if p.is_file() && !is_hidden(&p) {
+            out.push(p);
         }
     }
 }
