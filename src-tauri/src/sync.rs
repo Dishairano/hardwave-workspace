@@ -966,6 +966,8 @@ pub struct ArchiveReport {
     pub skipped: u32,
     pub workspace: String,
     pub errors: Vec<String>,
+    /// Whether the source folder itself is gone, not just its contents.
+    pub folder_removed: bool,
 }
 
 /// Upload every file under `src` to a workspace and delete the local copy,
@@ -1035,6 +1037,7 @@ pub async fn archive_folder(
         skipped: 0,
         workspace: ws.name.clone(),
         errors: Vec::new(),
+        folder_removed: false,
     };
 
     for (i, path) in files.iter().enumerate() {
@@ -1100,6 +1103,7 @@ pub async fn archive_folder(
     // Tidy up directories we emptied. remove_dir only succeeds on an empty one,
     // so anything still holding a skipped file is left alone.
     prune_empty_dirs(&src);
+    report.folder_removed = !src.exists();
 
     eprintln!(
         "[Archive] {} files moved to '{}', {} bytes freed, {} skipped",
@@ -1149,14 +1153,53 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Remove empty directories depth-first, including `dir` itself if it ends up empty.
+/// Files Windows and macOS generate to describe a folder. They are regenerated
+/// on demand and describe contents that are now gone, so once everything real
+/// has moved they are the only thing keeping an empty folder alive.
+fn is_folder_metadata(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "thumbs.db"
+        || n == "desktop.ini"
+        || n == ".ds_store"
+        || n == "folder.jpg"
+        || n == "albumart.jpg"
+        || (n.starts_with("albumart") && n.ends_with(".jpg"))
+}
+
+/// Remove directories we emptied, depth-first, including `dir` itself.
+///
+/// The first version left the folder behind: the hidden album art skipped
+/// during the move was still inside, so `remove_dir` refused. Windows-generated
+/// metadata is cleared when it is all that remains; a directory still holding
+/// anything real is left exactly as it is.
 fn prune_empty_dirs(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut metadata_files = Vec::new();
+    let mut has_real_content = false;
+
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
             prune_empty_dirs(&p);
+            // Still there after pruning means it holds something.
+            if p.exists() {
+                has_real_content = true;
+            }
+        } else {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if is_folder_metadata(&name) {
+                metadata_files.push(p);
+            } else {
+                has_real_content = true;
+            }
         }
+    }
+
+    if has_real_content {
+        return; // a real file is still here, so keep the folder and its metadata
+    }
+    for f in metadata_files {
+        let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir(dir);
 }

@@ -33,7 +33,8 @@
       "iconPath": "icons/icon.png",
       "iconAsTemplate": true,
       "tooltip": "Hardwave Workspace"
-    }
+    },
+    "withGlobalTauri": true
   },
   "bundle": {
     "active": true,
