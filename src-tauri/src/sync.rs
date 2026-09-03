@@ -968,6 +968,7 @@ pub struct ArchiveReport {
     pub errors: Vec<String>,
     /// Whether the source folder itself is gone, not just its contents.
     pub folder_removed: bool,
+    pub seconds: u64,
 }
 
 /// Upload every file under `src` to a workspace and delete the local copy,
@@ -1038,67 +1039,106 @@ pub async fn archive_folder(
         workspace: ws.name.clone(),
         errors: Vec::new(),
         folder_removed: false,
+        seconds: 0,
     };
 
-    for (i, path) in files.iter().enumerate() {
-        let name = match path.file_name() {
-            Some(n) => n.to_string_lossy().to_string(),
-            None => { report.skipped += 1; continue; }
-        };
-        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+    // Upload several at once. One-at-a-time left the connection idle between
+    // files, which on a folder of small samples is most of the wall time.
+    // Four matches the existing sync path and keeps memory predictable.
+    const PARALLEL: usize = 4;
 
-        // Mirror the local tree under a folder named after the source.
-        let rel_dir = path
-            .parent()
-            .and_then(|p| p.strip_prefix(&src).ok())
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let folder_path = if rel_dir.is_empty() {
-            base.clone()
-        } else {
-            format!("{}/{}", base, rel_dir)
-        };
+    let total_bytes: u64 = files.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
+    let started = std::time::Instant::now();
+    let done_files = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let results = Arc::new(Mutex::new(Vec::<(bool, u64, Option<String>)>::new()));
 
-        let _ = engine.app.emit(
-            "archive-progress",
-            serde_json::json!({ "current": i + 1, "total": total, "name": name }),
-        );
+    let tasks = futures_util::stream::iter(files.iter().cloned().map(|path| {
+        let token = token.clone();
+        let ws_id = ws.id.clone();
+        let base = base.clone();
+        let src = src.clone();
+        let app = engine.app.clone();
+        let done_files = done_files.clone();
+        let done_bytes = done_bytes.clone();
+        let results = results.clone();
+        async move {
+            let name = match path.file_name() {
+                Some(n) => n.to_string_lossy().to_string(),
+                None => return,
+            };
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
 
-        let sha = match hash_file(path) {
-            Ok(h) => h,
-            Err(e) => {
-                report.skipped += 1;
-                report.errors.push(format!("{name}: unreadable ({e})"));
-                continue;
+            let rel_dir = path
+                .parent()
+                .and_then(|p| p.strip_prefix(&src).ok())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let folder_path = if rel_dir.is_empty() { base.clone() } else { format!("{base}/{rel_dir}") };
+
+            let outcome = async {
+                let sha = hash_file(&path).map_err(|e| format!("unreadable ({e})"))?;
+                let up = api::init_upload(&token, &ws_id, &name, size, Some(&folder_path), &sha).await?;
+                api::upload_to_s3(&up.upload_url, &path).await?;
+                // Only Ok once the server has confirmed the object exists.
+                api::register_upload(&token, &ws_id, &up.file_id).await?;
+                Ok::<(), String>(())
             }
-        };
+            .await;
 
-        let outcome = async {
-            let up = api::init_upload(&token, &ws.id, &name, size, Some(&folder_path), &sha).await?;
-            api::upload_to_s3(&up.upload_url, path).await?;
-            // Only returns Ok once the server has confirmed the object exists.
-            api::register_upload(&token, &ws.id, &up.file_id).await?;
-            Ok::<(), String>(())
+            let entry = match outcome {
+                Ok(()) => match std::fs::remove_file(&path) {
+                    Ok(()) => (true, size, None),
+                    Err(e) => (false, 0, Some(format!("{name}: uploaded but not deleted ({e})"))),
+                },
+                Err(e) => (false, 0, Some(format!("{name}: {e}"))),
+            };
+            results.lock().await.push(entry);
+
+            let n = done_files.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let b = done_bytes.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+
+            // Estimate from throughput so far. Meaningless until a little has
+            // moved, so it is only sent once past the first file.
+            let elapsed = started.elapsed().as_secs_f64();
+            let eta = if b > 0 && elapsed > 1.0 && total_bytes > b {
+                let rate = b as f64 / elapsed;
+                Some(((total_bytes - b) as f64 / rate).round() as u64)
+            } else {
+                None
+            };
+
+            let _ = app.emit(
+                "archive-progress",
+                serde_json::json!({
+                    "current": n,
+                    "total": total,
+                    "name": name,
+                    "bytes_done": b,
+                    "bytes_total": total_bytes,
+                    "eta_seconds": eta,
+                }),
+            );
         }
-        .await;
+    }));
 
-        match outcome {
-            Ok(()) => match std::fs::remove_file(path) {
-                Ok(()) => {
-                    report.moved += 1;
-                    report.bytes_freed += size;
-                }
-                Err(e) => {
-                    // Safely in the cloud, just not removed here. Not a failure.
-                    report.errors.push(format!("{name}: uploaded but not deleted ({e})"));
-                }
-            },
-            Err(e) => {
+    use futures_util::StreamExt;
+    tasks.buffer_unordered(PARALLEL).collect::<Vec<()>>().await;
+
+    for (moved, bytes, err) in results.lock().await.iter() {
+        if *moved {
+            report.moved += 1;
+            report.bytes_freed += bytes;
+        } else {
+            if err.as_deref().map(|e| e.contains("uploaded but not deleted")).unwrap_or(false) {
+                // Safely stored, just not removed locally. Not a skip.
+            } else {
                 report.skipped += 1;
-                report.errors.push(format!("{name}: {e}"));
             }
+            if let Some(e) = err { report.errors.push(e.clone()); }
         }
     }
+    report.seconds = started.elapsed().as_secs();
 
     // Tidy up directories we emptied. remove_dir only succeeds on an empty one,
     // so anything still holding a skipped file is left alone.
