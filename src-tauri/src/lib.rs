@@ -393,6 +393,17 @@ async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first. A second launch focuses the running window
+        // instead of starting another copy — two instances meant two tray icons
+        // and two sync engines fighting over the same folder.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.unminimize();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {

@@ -48,3 +48,6 @@ windows = { version = "0.58", features = [
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+# Stops a second copy running: two instances each draw their own tray icon,
+# and only one of them owns the sync root.
+tauri-plugin-single-instance = "2"
