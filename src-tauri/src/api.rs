@@ -230,16 +230,47 @@ pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) ->
 }
 
 /// Initiate a file upload (get presigned upload URL).
+/// The API sends each value twice for compatibility: `uploadUrl` and
+/// `upload_url`, `fileId` (a number) and `file_id` (a string). A serde `alias`
+/// maps both spellings onto one field, which serde then rejects as a duplicate
+/// field — so every upload failed before it began. Read the raw shape and pick
+/// whichever spelling is present.
 #[derive(Debug, Deserialize)]
+struct RawUploadInit {
+    #[serde(rename = "uploadUrl", default)]
+    upload_url_camel: Option<String>,
+    #[serde(rename = "upload_url", default)]
+    upload_url_snake: Option<String>,
+    #[serde(rename = "fileId", default)]
+    file_id_camel: Option<serde_json::Value>,
+    #[serde(rename = "file_id", default)]
+    file_id_snake: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
 pub struct UploadInitResponse {
-    #[serde(alias = "uploadUrl")]
     pub upload_url: String,
-    /// The API returns this twice for compatibility: `fileId` as a number and
-    /// `file_id` as a string. The alias means serde meets the number first and
-    /// fails to put it in a String, which reqwest surfaces only as the useless
-    /// "error decoding response body". Coerce either form.
-    #[serde(alias = "fileId", deserialize_with = "id_from_json")]
     pub file_id: String,
+}
+
+impl UploadInitResponse {
+    fn from_raw(r: RawUploadInit) -> Result<Self, String> {
+        let upload_url = r
+            .upload_url_camel
+            .or(r.upload_url_snake)
+            .ok_or_else(|| "no uploadUrl in the reply".to_string())?;
+        let id = r
+            .file_id_camel
+            .or(r.file_id_snake)
+            .ok_or_else(|| "no fileId in the reply".to_string())?;
+        // Sent as a number under one name and a string under the other.
+        let file_id = match id {
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::String(v) => v,
+            other => return Err(format!("unexpected fileId: {other}")),
+        };
+        Ok(Self { upload_url, file_id })
+    }
 }
 
 pub async fn init_upload(
@@ -276,10 +307,11 @@ pub async fn init_upload(
     // "error decoding response body", which says nothing about which field
     // was wrong.
     let body = res.text().await.map_err(|e| format!("Upload init read failed: {e}"))?;
-    serde_json::from_str::<UploadInitResponse>(&body).map_err(|e| {
+    let raw = serde_json::from_str::<RawUploadInit>(&body).map_err(|e| {
         format!("Upload init returned an unexpected reply ({e}): {}",
                 body.chars().take(200).collect::<String>())
-    })
+    })?;
+    UploadInitResponse::from_raw(raw)
 }
 
 /// Confirm upload completion.
