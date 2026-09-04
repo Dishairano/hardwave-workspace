@@ -462,6 +462,26 @@ pub fn run() {
                                     Err(e) => format!("Could not free up space: {e}"),
                                 };
                                 eprintln!("[FreeSpace] {msg}");
+
+                                // Report through a native notification. The
+                                // webview toast below cannot be the only channel:
+                                // window.__HW_TOAST__ is not defined anywhere in
+                                // the deployed UI, and the `&&` guard turns that
+                                // into silence rather than an error. This is a
+                                // tray action, so the window is usually closed
+                                // too, and get_webview_window returns None. The
+                                // result is that freeing space appeared to do
+                                // nothing at all.
+                                use tauri_plugin_notification::NotificationExt;
+                                if let Err(e) = app.notification()
+                                    .builder()
+                                    .title("Hardwave Workspace")
+                                    .body(&msg)
+                                    .show()
+                                {
+                                    eprintln!("[FreeSpace] notification failed: {e}");
+                                }
+
                                 if let Some(win) = app.get_webview_window("main") {
                                     let safe: String =
                                         msg.chars().filter(|c| *c != '\\' && *c != '\'').collect();
