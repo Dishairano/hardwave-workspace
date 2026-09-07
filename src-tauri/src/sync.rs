@@ -921,11 +921,13 @@ impl SyncEngine {
                 write_index(&idx);
             }
 
-            // Upload in parallel batches. Size matches the server upload rate
-            // limit headroom (limit sized for ~6-8 concurrent); the index lock
-            // is only taken for the brief per-batch flush below.
+            // Upload in parallel batches. 16-wide to push through a large
+            // backlog of many small files, where per-file API round-trips (not
+            // bandwidth) are the limit; the server upload rate limit was raised
+            // to match. The index lock is only taken for the brief per-batch
+            // flush below.
             let mut uploaded_count = 0usize;
-            for batch in to_upload.chunks(8) {
+            for batch in to_upload.chunks(16) {
                 let mut tasks = Vec::new();
                 for (full_rel, local_path, size, sha_opt) in batch {
                     let token = token.to_string();
