@@ -921,9 +921,11 @@ impl SyncEngine {
                 write_index(&idx);
             }
 
-            // Upload in parallel batches of 4 (no index lock held)
-            let mut uploaded: Vec<SyncEntry> = Vec::new();
-            for batch in to_upload.chunks(4) {
+            // Upload in parallel batches. Size matches the server upload rate
+            // limit headroom (limit sized for ~6-8 concurrent); the index lock
+            // is only taken for the brief per-batch flush below.
+            let mut uploaded_count = 0usize;
+            for batch in to_upload.chunks(8) {
                 let mut tasks = Vec::new();
                 for (full_rel, local_path, size, sha_opt) in batch {
                     let token = token.to_string();
@@ -990,10 +992,11 @@ impl SyncEngine {
                 }
 
                 let results = futures_util::future::join_all(tasks).await;
+                let mut batch_entries: Vec<SyncEntry> = Vec::new();
                 for result in results {
                     match result {
                         Ok(Ok((full_rel, sha, size, file_id, ws_id, entry_mtime))) => {
-                            uploaded.push(SyncEntry {
+                            batch_entries.push(SyncEntry {
                                 rel_path: full_rel,
                                 sha256: sha,
                                 modified: chrono::Utc::now().to_rfc3339(),
@@ -1007,15 +1010,24 @@ impl SyncEngine {
                         Err(e) => eprintln!("[Sync] Upload task panicked: {}", e),
                     }
                 }
-            }
-
-            // Update index with uploaded files (brief lock)
-            if !uploaded.is_empty() {
-                let mut idx = self.index.lock().await;
-                for e in &uploaded {
-                    idx.insert(e.rel_path.clone(), e.clone());
+                // Persist each batch as it lands, not once at the end of the
+                // workspace. On a big workspace this means progress survives a
+                // restart (a batch already on S3 is not re-uploaded) and the
+                // panel advances live instead of only when the workspace ends.
+                if !batch_entries.is_empty() {
+                    uploaded_count += batch_entries.len();
+                    {
+                        let mut idx = self.index.lock().await;
+                        for e in &batch_entries {
+                            idx.insert(e.rel_path.clone(), e.clone());
+                        }
+                        write_index(&idx);
+                    }
+                    let _ = self.app.emit("sync:status", self.get_status().await);
                 }
-                write_index(&idx);
+            }
+            if uploaded_count > 0 {
+                eprintln!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
             }
         }
 
