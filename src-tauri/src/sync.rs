@@ -87,16 +87,25 @@ fn file_mtime(path: &Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-/// What the upload scan should do with one local file — decided from size and
-/// mtime alone, no hashing, so the scan never blocks the sync loop on I/O.
+/// What the upload scan should do with one local file — decided from size,
+/// mtime and whether it is already uploaded, no hashing, so the scan never
+/// blocks the sync loop on I/O.
 #[derive(Debug, PartialEq, Eq)]
 enum UploadPlan {
-    /// Untracked or size changed: upload it. Hashing is deferred to the upload
-    /// worker, so a first-time sync of 100k files starts uploading immediately
-    /// instead of SHA-256'ing every file up front (which is what stalled it).
+    /// Untracked, size changed, or indexed but never uploaded: upload it.
+    /// Hashing is deferred to the upload worker, so a first sync of 100k files
+    /// starts uploading immediately instead of SHA-256'ing every file up front.
     UploadNew,
-    /// Same size as recorded but mtime is unknown or differs — hash to be sure
-    /// we do not skip a genuine edit or re-upload an unchanged file.
+    /// Already uploaded, same size, but never tagged with an mtime (an entry
+    /// from before mtime tracking): trust it as unchanged and just record the
+    /// mtime. No hashing — which also means dehydrated placeholders are NOT
+    /// hydrated just to be checked. Tradeoff: a same-size edit made before this
+    /// version shipped would not be re-detected on this one pass; any later
+    /// edit changes the mtime and is caught, and the server still holds the
+    /// prior copy. Worth it to not re-hash/hydrate ~70 GB on every upgrade.
+    TrustBackfill,
+    /// Same size, had an mtime, but it changed (or is now unreadable) — a
+    /// possible genuine edit; hash to decide.
     VerifyByHash,
     /// Same size and mtime as recorded: unchanged, skip without hashing.
     Skip,
@@ -105,15 +114,22 @@ enum UploadPlan {
 fn plan_upload(
     indexed_size: Option<u64>,
     indexed_mtime: Option<i64>,
+    already_uploaded: bool,
     size: u64,
     mtime: Option<i64>,
 ) -> UploadPlan {
     match indexed_size {
         None => UploadPlan::UploadNew,
         Some(s) if s != size => UploadPlan::UploadNew,
+        // Indexed but the previous upload never completed (no remote id): send it.
+        Some(_) if !already_uploaded => UploadPlan::UploadNew,
         Some(_) => match (indexed_mtime, mtime) {
             (Some(a), Some(b)) if a == b => UploadPlan::Skip,
-            _ => UploadPlan::VerifyByHash,
+            // No stored mtime = a pre-mtime entry; it is already uploaded, so
+            // trust it and backfill rather than re-hash/hydrate.
+            (None, _) => UploadPlan::TrustBackfill,
+            // Had an mtime and it no longer matches: verify by hash.
+            (Some(_), _) => UploadPlan::VerifyByHash,
         },
     }
 }
@@ -123,27 +139,31 @@ mod upload_plan_tests {
     use super::*;
     #[test]
     fn untracked_uploads() {
-        assert_eq!(plan_upload(None, None, 10, Some(5)), UploadPlan::UploadNew);
+        assert_eq!(plan_upload(None, None, false, 10, Some(5)), UploadPlan::UploadNew);
     }
     #[test]
     fn size_change_uploads() {
-        assert_eq!(plan_upload(Some(9), Some(5), 10, Some(5)), UploadPlan::UploadNew);
+        assert_eq!(plan_upload(Some(9), Some(5), true, 10, Some(5)), UploadPlan::UploadNew);
+    }
+    #[test]
+    fn indexed_but_not_uploaded_uploads() {
+        assert_eq!(plan_upload(Some(10), None, false, 10, Some(5)), UploadPlan::UploadNew);
     }
     #[test]
     fn same_size_and_mtime_skips() {
-        assert_eq!(plan_upload(Some(10), Some(5), 10, Some(5)), UploadPlan::Skip);
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(5)), UploadPlan::Skip);
+    }
+    #[test]
+    fn uploaded_no_stored_mtime_trusts() {
+        assert_eq!(plan_upload(Some(10), None, true, 10, Some(5)), UploadPlan::TrustBackfill);
     }
     #[test]
     fn same_size_diff_mtime_verifies() {
-        assert_eq!(plan_upload(Some(10), Some(5), 10, Some(6)), UploadPlan::VerifyByHash);
-    }
-    #[test]
-    fn same_size_no_stored_mtime_verifies() {
-        assert_eq!(plan_upload(Some(10), None, 10, Some(5)), UploadPlan::VerifyByHash);
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(6)), UploadPlan::VerifyByHash);
     }
     #[test]
     fn same_size_unknown_current_mtime_verifies() {
-        assert_eq!(plan_upload(Some(10), Some(5), 10, None), UploadPlan::VerifyByHash);
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, None), UploadPlan::VerifyByHash);
     }
 }
 
@@ -839,10 +859,11 @@ impl SyncEngine {
             // below does file I/O (stat, and sometimes a hash) and must NOT
             // hold the mutex while it runs — holding it here while SHA-256'ing
             // every file is what wedged the whole engine on a big first sync.
-            let idx_snapshot: HashMap<String, (u64, String, Option<i64>)> = {
+            // Tuple: (size, sha256, mtime, already_uploaded).
+            let idx_snapshot: HashMap<String, (u64, String, Option<i64>, bool)> = {
                 let idx = self.index.lock().await;
                 idx.iter()
-                    .map(|(k, e)| (k.clone(), (e.size, e.sha256.clone(), e.mtime)))
+                    .map(|(k, e)| (k.clone(), (e.size, e.sha256.clone(), e.mtime, e.remote_id.is_some())))
                     .collect()
             };
 
@@ -857,8 +878,16 @@ impl SyncEngine {
                 let full_rel = format!("{}/{}", ws.name, local_rel);
                 let indexed = idx_snapshot.get(&full_rel);
                 let mtime = file_mtime(local_path);
-                match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), *size, mtime) {
+                let uploaded = indexed.map(|e| e.3).unwrap_or(false);
+                match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), uploaded, *size, mtime) {
                     UploadPlan::Skip => {}
+                    // Already uploaded, just never tagged: record its mtime, no
+                    // hash, no re-upload (and no placeholder hydration).
+                    UploadPlan::TrustBackfill => {
+                        if let Some(m) = mtime {
+                            backfill_mtime.push((full_rel, m));
+                        }
+                    }
                     UploadPlan::UploadNew => {
                         to_upload.push((full_rel, local_path.clone(), *size, None));
                     }
