@@ -31,6 +31,12 @@ pub struct SyncEntry {
     pub remote_id: Option<String>,
     /// Workspace ID this file belongs to.
     pub workspace_id: Option<String>,
+    /// Local file mtime (unix seconds) recorded when this entry was written.
+    /// Lets a later pass skip re-hashing an unchanged file (size + mtime match)
+    /// instead of SHA-256'ing every file every cycle. Defaulted so older index
+    /// files (which lack it) still load and simply fall back to hashing once.
+    #[serde(default)]
+    pub mtime: Option<i64>,
 }
 
 /// State pushed to the frontend via events.

@@ -78,6 +78,75 @@ fn is_safe_rel_path(path: &str) -> bool {
 }
 
 /// Scan the sync root and return all files with their hashes.
+/// Local file mtime as unix seconds, if the platform reports it.
+fn file_mtime(path: &Path) -> Option<i64> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+}
+
+/// What the upload scan should do with one local file — decided from size and
+/// mtime alone, no hashing, so the scan never blocks the sync loop on I/O.
+#[derive(Debug, PartialEq, Eq)]
+enum UploadPlan {
+    /// Untracked or size changed: upload it. Hashing is deferred to the upload
+    /// worker, so a first-time sync of 100k files starts uploading immediately
+    /// instead of SHA-256'ing every file up front (which is what stalled it).
+    UploadNew,
+    /// Same size as recorded but mtime is unknown or differs — hash to be sure
+    /// we do not skip a genuine edit or re-upload an unchanged file.
+    VerifyByHash,
+    /// Same size and mtime as recorded: unchanged, skip without hashing.
+    Skip,
+}
+
+fn plan_upload(
+    indexed_size: Option<u64>,
+    indexed_mtime: Option<i64>,
+    size: u64,
+    mtime: Option<i64>,
+) -> UploadPlan {
+    match indexed_size {
+        None => UploadPlan::UploadNew,
+        Some(s) if s != size => UploadPlan::UploadNew,
+        Some(_) => match (indexed_mtime, mtime) {
+            (Some(a), Some(b)) if a == b => UploadPlan::Skip,
+            _ => UploadPlan::VerifyByHash,
+        },
+    }
+}
+
+#[cfg(test)]
+mod upload_plan_tests {
+    use super::*;
+    #[test]
+    fn untracked_uploads() {
+        assert_eq!(plan_upload(None, None, 10, Some(5)), UploadPlan::UploadNew);
+    }
+    #[test]
+    fn size_change_uploads() {
+        assert_eq!(plan_upload(Some(9), Some(5), 10, Some(5)), UploadPlan::UploadNew);
+    }
+    #[test]
+    fn same_size_and_mtime_skips() {
+        assert_eq!(plan_upload(Some(10), Some(5), 10, Some(5)), UploadPlan::Skip);
+    }
+    #[test]
+    fn same_size_diff_mtime_verifies() {
+        assert_eq!(plan_upload(Some(10), Some(5), 10, Some(6)), UploadPlan::VerifyByHash);
+    }
+    #[test]
+    fn same_size_no_stored_mtime_verifies() {
+        assert_eq!(plan_upload(Some(10), None, 10, Some(5)), UploadPlan::VerifyByHash);
+    }
+    #[test]
+    fn same_size_unknown_current_mtime_verifies() {
+        assert_eq!(plan_upload(Some(10), Some(5), 10, None), UploadPlan::VerifyByHash);
+    }
+}
+
 fn scan_local(root: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut files = Vec::new();
     if !root.exists() {
@@ -540,6 +609,7 @@ impl SyncEngine {
                 size: meta.len(),
                 remote_id: Some(upload.0),
                 workspace_id: Some(upload.1),
+                mtime: file_mtime(&full_path),
             });
             write_index(&index);
         }
@@ -653,6 +723,7 @@ impl SyncEngine {
                             size: local_path.metadata().map(|m| m.len()).unwrap_or(0),
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
+                            mtime: file_mtime(&local_path),
                         });
                         continue;
                     }
@@ -688,6 +759,10 @@ impl SyncEngine {
                                 size: rf.size,
                                 remote_id: Some(rf.id.clone()),
                                 workspace_id: Some(ws.id.clone()),
+                                // Record the placeholder's mtime so the upload
+                                // scan skips it by size+mtime and never hashes
+                                // (which would hydrate) a cloud-only file.
+                                mtime: file_mtime(&local_path),
                             });
                             self.emit_file_progress(rel_path, "placeholder", 100);
                             continue;
@@ -738,6 +813,7 @@ impl SyncEngine {
                             size,
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
+                            mtime: file_mtime(&root.join(rel_path.as_str())),
                         });
                         self.emit_file_progress(rel_path, "download", 100);
                     }
@@ -759,50 +835,75 @@ impl SyncEngine {
             // ── Upload phase ────────────────────────────────────────
             let local_files = scan_local(&ws_dir);
 
-            // Determine what needs uploading (brief index lock)
-            let to_upload: Vec<(String, PathBuf, u64, String)> = {
+            // Snapshot index metadata once, then release the lock. The scan
+            // below does file I/O (stat, and sometimes a hash) and must NOT
+            // hold the mutex while it runs — holding it here while SHA-256'ing
+            // every file is what wedged the whole engine on a big first sync.
+            let idx_snapshot: HashMap<String, (u64, String, Option<i64>)> = {
                 let idx = self.index.lock().await;
-                local_files.iter().filter_map(|(local_rel, local_path, size)| {
-                    let full_rel = format!("{}/{}", ws.name, local_rel);
-                    // Presence in the index used to be enough to skip a file, so
-                    // editing something that had already synced never uploaded
-                    // again: open a project from the workspace, save it, and the
-                    // server kept the old version forever. Compare contents.
-                    //
-                    // Size is checked first because it is free; the hash only
-                    // runs when the size matches, which is the common case.
-                    if let Some(entry) = idx.get(&full_rel) {
-                        if entry.size == *size {
-                            match hash_file(local_path) {
-                                Ok(h) if h == entry.sha256 => return None, // unchanged
-                                Ok(h) => {
-                                    eprintln!("[Sync] Modified, re-uploading: {}", full_rel);
-                                    return Some((full_rel, local_path.clone(), *size, h));
-                                }
-                                // Unreadable (locked by the DAW, say). Leave it
-                                // for the next pass rather than uploading junk.
-                                Err(_) => return None,
+                idx.iter()
+                    .map(|(k, e)| (k.clone(), (e.size, e.sha256.clone(), e.mtime)))
+                    .collect()
+            };
+
+            // Decide what to upload WITHOUT hashing new files. `sha` is None
+            // when hashing is deferred to the upload worker (untracked or
+            // size-changed files), so a first sync of 100k files starts
+            // uploading at once instead of hashing 100 GB up front. It is Some
+            // only when we already had to hash to confirm a real edit.
+            let mut to_upload: Vec<(String, PathBuf, u64, Option<String>)> = Vec::new();
+            let mut backfill_mtime: Vec<(String, i64)> = Vec::new();
+            for (local_rel, local_path, size) in &local_files {
+                let full_rel = format!("{}/{}", ws.name, local_rel);
+                let indexed = idx_snapshot.get(&full_rel);
+                let mtime = file_mtime(local_path);
+                match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), *size, mtime) {
+                    UploadPlan::Skip => {}
+                    UploadPlan::UploadNew => {
+                        to_upload.push((full_rel, local_path.clone(), *size, None));
+                    }
+                    UploadPlan::VerifyByHash => match hash_file(local_path) {
+                        // Unchanged after all: record the mtime so the next pass
+                        // skips it for free instead of hashing it again. This is
+                        // what stops the engine re-hashing everything every cycle.
+                        Ok(h) if indexed.map(|e| e.1.as_str()) == Some(h.as_str()) => {
+                            if let Some(m) = mtime {
+                                backfill_mtime.push((full_rel, m));
                             }
                         }
-                        eprintln!("[Sync] Size changed, re-uploading: {}", full_rel);
+                        Ok(h) => {
+                            eprintln!("[Sync] Modified, re-uploading: {}", full_rel);
+                            to_upload.push((full_rel, local_path.clone(), *size, Some(h)));
+                        }
+                        // Unreadable (locked by the DAW, say). Leave for next pass.
+                        Err(_) => {}
+                    },
+                }
+            }
+
+            // Backfill mtimes for files confirmed unchanged (brief lock).
+            if !backfill_mtime.is_empty() {
+                let mut idx = self.index.lock().await;
+                for (rel, m) in &backfill_mtime {
+                    if let Some(e) = idx.get_mut(rel) {
+                        e.mtime = Some(*m);
                     }
-                    let sha = hash_file(local_path).ok()?;
-                    Some((full_rel, local_path.clone(), *size, sha))
-                }).collect()
-            };
+                }
+                write_index(&idx);
+            }
 
             // Upload in parallel batches of 4 (no index lock held)
             let mut uploaded: Vec<SyncEntry> = Vec::new();
             for batch in to_upload.chunks(4) {
                 let mut tasks = Vec::new();
-                for (full_rel, local_path, size, sha) in batch {
+                for (full_rel, local_path, size, sha_opt) in batch {
                     let token = token.to_string();
                     let ws_id = ws.id.clone();
                     let ws_name = ws.name.clone();
                     let full_rel = full_rel.clone();
                     let local_path = local_path.clone();
                     let size = *size;
-                    let sha = sha.clone();
+                    let sha_opt = sha_opt.clone();
 
                     tasks.push(tokio::spawn(async move {
                         let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
@@ -815,6 +916,21 @@ impl SyncEngine {
                             .and_then(|p| p.to_str())
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
+
+                        // Record the file's mtime, and hash it now if hashing was
+                        // deferred — once, off the async worker, before any retry.
+                        let entry_mtime = file_mtime(&local_path);
+                        let sha = match sha_opt {
+                            Some(s) => s,
+                            None => {
+                                let p = local_path.clone();
+                                match tokio::task::spawn_blocking(move || hash_file(&p)).await {
+                                    Ok(Ok(h)) => h,
+                                    Ok(Err(e)) => return Err(format!("hash failed: {}", e)),
+                                    Err(e) => return Err(format!("hash task panicked: {}", e)),
+                                }
+                            }
+                        };
 
                         let upload = api::with_retry({
                             let token = token.clone();
@@ -839,14 +955,15 @@ impl SyncEngine {
                                 })
                             }
                         }, 2).await?;
-                        Ok::<_, String>(upload)
+                        let (fr, sh, sz, fid, wid) = upload;
+                        Ok::<_, String>((fr, sh, sz, fid, wid, entry_mtime))
                     }));
                 }
 
                 let results = futures_util::future::join_all(tasks).await;
                 for result in results {
                     match result {
-                        Ok(Ok((full_rel, sha, size, file_id, ws_id))) => {
+                        Ok(Ok((full_rel, sha, size, file_id, ws_id, entry_mtime))) => {
                             uploaded.push(SyncEntry {
                                 rel_path: full_rel,
                                 sha256: sha,
@@ -854,6 +971,7 @@ impl SyncEngine {
                                 size,
                                 remote_id: Some(file_id),
                                 workspace_id: Some(ws_id),
+                                mtime: entry_mtime,
                             });
                         }
                         Ok(Err(e)) => eprintln!("[Sync] Upload failed: {}", e),
