@@ -130,6 +130,9 @@ pub struct SyncEngine {
     sse_handles: Mutex<Vec<tokio::task::AbortHandle>>,
     /// Notified by SSE listeners to trigger an immediate full sync.
     sse_trigger: Arc<tokio::sync::Notify>,
+    /// Cached (computed_at, files_on_disk, bytes_on_disk) so get_status can
+    /// report the honest total without re-walking 120k files on every call.
+    disk_cache: RwLock<Option<(std::time::Instant, u32, u64)>>,
 }
 
 impl SyncEngine {
@@ -143,6 +146,11 @@ impl SyncEngine {
                 files_synced: 0,
                 last_sync: None,
                 error: None,
+                files_total: 0,
+                bytes_synced: 0,
+                bytes_total: 0,
+                current_file: None,
+                current_percent: 0,
             })),
             index: Arc::new(Mutex::new(index)),
             app,
@@ -150,6 +158,7 @@ impl SyncEngine {
             sync_active: AtomicBool::new(false),
             sse_handles: Mutex::new(Vec::new()),
             sse_trigger: Arc::new(tokio::sync::Notify::new()),
+            disk_cache: RwLock::new(None),
         }
     }
 
@@ -209,7 +218,55 @@ impl SyncEngine {
     }
 
     pub async fn get_status(&self) -> SyncStatus {
-        self.status.read().await.clone()
+        // Start from the stored state (state/last_sync/error) then overlay the
+        // honest counts so the UI shows uploaded-of-actual, never a fake 100%.
+        let mut s = self.status.read().await.clone();
+        let (fs, bs) = self.synced_totals().await;
+        let (ft, bt) = self.disk_totals().await;
+        s.files_synced = fs;
+        s.bytes_synced = bs;
+        // Never let the total read below what is already synced (a stale cache
+        // mid-upload could otherwise show synced > total).
+        s.files_total = ft.max(fs);
+        s.bytes_total = bt.max(bs);
+        s.files_pending = s.files_total.saturating_sub(fs);
+        s
+    }
+
+    /// What has actually been uploaded: index entries carrying a remote id.
+    async fn synced_totals(&self) -> (u32, u64) {
+        let idx = self.index.lock().await;
+        let mut n = 0u32;
+        let mut b = 0u64;
+        for e in idx.values() {
+            if e.remote_id.is_some() {
+                n += 1;
+                b += e.size;
+            }
+        }
+        (n, b)
+    }
+
+    /// Files + bytes actually on disk under the sync root. Stat only, no
+    /// hashing, so it is cheap; still cached for 30s to keep get_status snappy.
+    async fn disk_totals(&self) -> (u32, u64) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        if let Some((t, f, b)) = *self.disk_cache.read().await {
+            if t.elapsed() < TTL {
+                return (f, b);
+            }
+        }
+        let (f, b) = tokio::task::spawn_blocking(Self::scan_disk_totals)
+            .await
+            .unwrap_or((0, 0));
+        *self.disk_cache.write().await = Some((std::time::Instant::now(), f, b));
+        (f, b)
+    }
+
+    fn scan_disk_totals() -> (u32, u64) {
+        let files = scan_local(&sync_root());
+        let bytes: u64 = files.iter().map(|(_, _, s)| *s).sum();
+        (files.len() as u32, bytes)
     }
 
     async fn update_status(&self, state: &str, error: Option<String>) {

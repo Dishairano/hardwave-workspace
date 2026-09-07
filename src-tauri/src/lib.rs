@@ -126,6 +126,11 @@ async fn get_sync_status(state: State<'_, AppState>) -> Result<SyncStatus, Strin
             files_synced: 0,
             last_sync: None,
             error: None,
+            files_total: 0,
+            bytes_synced: 0,
+            bytes_total: 0,
+            current_file: None,
+            current_percent: 0,
         })
     }
 }

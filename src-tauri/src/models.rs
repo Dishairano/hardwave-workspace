@@ -41,6 +41,23 @@ pub struct SyncStatus {
     pub files_synced: u32,
     pub last_sync: Option<String>,
     pub error: Option<String>,
+    /// Honest totals so the UI never shows a fake 100%. `files_total` /
+    /// `bytes_total` are what is actually on disk under the sync root;
+    /// `files_synced` / `bytes_synced` are what has a remote id (uploaded).
+    /// The gap between them is real, unbacked-up data — the number the user
+    /// most needs to see. Defaulted so older persisted/serialized shapes still
+    /// deserialize.
+    #[serde(default)]
+    pub files_total: u32,
+    #[serde(default)]
+    pub bytes_synced: u64,
+    #[serde(default)]
+    pub bytes_total: u64,
+    /// The file currently moving, if any, and its percent — for a live line.
+    #[serde(default)]
+    pub current_file: Option<String>,
+    #[serde(default)]
+    pub current_percent: u32,
 }
 
 
