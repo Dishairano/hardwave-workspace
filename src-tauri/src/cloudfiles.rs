@@ -13,7 +13,11 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+// Only the Windows implementation builds paths; importing it everywhere made
+// `cargo clippy -D warnings` fail on Linux, which is why CI was red.
+#[cfg(windows)]
+use std::path::PathBuf;
 
 /// What the sync engine tells us about a remote file so we can fake it locally.
 #[derive(Clone, Debug)]

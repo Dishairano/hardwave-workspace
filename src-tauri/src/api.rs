@@ -338,16 +338,227 @@ pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Resu
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = reqwest::Body::wrap_stream(stream);
 
-    let res = http_client()
-        .put(upload_url)
-        .header("content-length", file_size)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("S3 upload failed: {}", e))?;
+    // Not http_client(): its 60 s is a TOTAL deadline that includes sending the
+    // body, so any file that could not upload within a minute failed on every
+    // retry, forever. This deadline grows with the file (25 KB/s worst case).
+    let deadline = upload_deadline(file_size);
+    let res = tokio::time::timeout(
+        deadline,
+        upload_client()
+            .put(upload_url)
+            .header("content-length", file_size)
+            .body(body)
+            .send(),
+    )
+    .await
+    .map_err(|_| format!("S3 upload timed out after {} s", deadline.as_secs()))?
+    .map_err(|e| format!("S3 upload failed: {}", e))?;
 
     if !res.status().is_success() {
         return Err(format!("S3 upload error: {}", res.status()));
     }
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// Uploads
+// ---------------------------------------------------------------------------
+
+/// Files above this go up in parts, so a dropped connection costs one part
+/// instead of the whole file.
+const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// S3 requires parts of at least 5 MB (except the last).
+const PART_SIZE: u64 = 16 * 1024 * 1024;
+const PART_ATTEMPTS: u32 = 4;
+
+/// Client for S3 transfers. No total deadline (see upload_to_s3); a
+/// connection that stops delivering a response still errors after 120 s.
+fn upload_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Failed to create upload HTTP client")
+    })
+}
+
+/// Time allowed for sending `bytes`: a minute, plus the time it takes at
+/// 25 KB/s. Generous on purpose; it only has to catch a transfer that hangs.
+fn upload_deadline(bytes: u64) -> Duration {
+    Duration::from_secs(60 + bytes / 25_000)
+}
+
+/// Upload one file and return its remote file id. Returns Ok only once the
+/// server has marked the file ready: after `register_upload` for a single
+/// PUT, or after the multipart `complete` for a large file.
+pub async fn upload_file(
+    token: &str,
+    workspace_id: &str,
+    filename: &str,
+    size: u64,
+    folder_path: Option<&str>,
+    sha256: &str,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    if size <= MULTIPART_THRESHOLD {
+        let u = init_upload(token, workspace_id, filename, size, folder_path, sha256).await?;
+        upload_to_s3(&u.upload_url, path).await?;
+        register_upload(token, workspace_id, &u.file_id).await?;
+        return Ok(u.file_id);
+    }
+    upload_multipart(token, workspace_id, filename, size, folder_path, sha256, path).await
+}
+
+#[derive(Deserialize)]
+struct MultipartInit {
+    #[serde(rename = "uploadId")]
+    upload_id: String,
+    #[serde(rename = "storageKey")]
+    storage_key: String,
+    #[serde(rename = "fileId", deserialize_with = "id_from_json")]
+    file_id: String,
+}
+
+#[derive(Deserialize)]
+struct PartUrls {
+    urls: Vec<String>,
+}
+
+async fn multipart_call(token: &str, workspace_id: &str, body: &serde_json::Value) -> Result<String, String> {
+    let action = body["action"].as_str().unwrap_or("multipart");
+    let res = http_client()
+        .post(format!("{}/workspaces/{}/files/multipart", WS_BASE, workspace_id))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Multipart {action} failed: {e}"))?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| format!("Multipart {action} read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Multipart {action} error {status}: {}", text.chars().take(200).collect::<String>()));
+    }
+    Ok(text)
+}
+
+async fn upload_multipart(
+    token: &str,
+    workspace_id: &str,
+    filename: &str,
+    size: u64,
+    folder_path: Option<&str>,
+    sha256: &str,
+    path: &std::path::Path,
+) -> Result<String, String> {
+    let mut body = serde_json::json!({
+        "action": "initiate",
+        "filename": filename,
+        "sizeBytes": size,
+        "sha256": sha256,
+        "mimeType": "application/octet-stream",
+    });
+    if let Some(fp) = folder_path {
+        body["folder_path"] = serde_json::Value::String(fp.to_string());
+    }
+    let text = multipart_call(token, workspace_id, &body).await?;
+    let init: MultipartInit = serde_json::from_str(&text).map_err(|e| {
+        format!("Multipart initiate returned an unexpected reply ({e}): {}", text.chars().take(200).collect::<String>())
+    })?;
+
+    let result = send_parts(token, workspace_id, &init, size, path).await;
+    if let Err(e) = result {
+        // Free the parts already stored and drop the pending row; the caller's
+        // retry starts a clean upload.
+        let _ = multipart_call(token, workspace_id, &serde_json::json!({
+            "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
+        })).await;
+        return Err(e);
+    }
+    Ok(init.file_id)
+}
+
+async fn send_parts(
+    token: &str,
+    workspace_id: &str,
+    init: &MultipartInit,
+    size: u64,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let part_count = size.div_ceil(PART_SIZE) as u32;
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| format!("Open file error: {e}"))?;
+    let mut parts = Vec::with_capacity(part_count as usize);
+
+    for number in 1..=part_count {
+        let offset = u64::from(number - 1) * PART_SIZE;
+        let len = PART_SIZE.min(size - offset) as usize;
+        let mut chunk = vec![0u8; len];
+        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| format!("Seek error: {e}"))?;
+        file.read_exact(&mut chunk).await.map_err(|e| format!("Read error at part {number}: {e}"))?;
+
+        let etag = send_part(token, workspace_id, init, number, chunk).await?;
+        parts.push(serde_json::json!({ "PartNumber": number, "ETag": etag }));
+    }
+
+    multipart_call(token, workspace_id, &serde_json::json!({
+        "action": "complete", "storageKey": init.storage_key, "uploadId": init.upload_id, "parts": parts,
+    })).await?;
+    Ok(())
+}
+
+/// PUT one part. The presigned URL is fetched right before every attempt:
+/// they expire after 15 minutes, which a whole large file easily outlasts.
+async fn send_part(
+    token: &str,
+    workspace_id: &str,
+    init: &MultipartInit,
+    number: u32,
+    chunk: Vec<u8>,
+) -> Result<String, String> {
+    let mut last_err = String::new();
+    for attempt in 0..PART_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+        }
+        let text = match multipart_call(token, workspace_id, &serde_json::json!({
+            "action": "get-part-urls", "storageKey": init.storage_key, "uploadId": init.upload_id,
+            "firstPart": number, "partCount": 1,
+        })).await {
+            Ok(t) => t,
+            Err(e) => { last_err = e; continue; }
+        };
+        let url = match serde_json::from_str::<PartUrls>(&text).ok().and_then(|u| u.urls.into_iter().next()) {
+            Some(u) => u,
+            None => { last_err = format!("no URL for part {number}"); continue; }
+        };
+
+        let deadline = upload_deadline(chunk.len() as u64);
+        let sent = tokio::time::timeout(
+            deadline,
+            upload_client()
+                .put(&url)
+                .header("content-length", chunk.len())
+                .body(chunk.clone())
+                .send(),
+        )
+        .await;
+        match sent {
+            Ok(Ok(res)) if res.status().is_success() => {
+                match res.headers().get("etag").and_then(|v| v.to_str().ok()) {
+                    Some(etag) if !etag.is_empty() => return Ok(etag.to_string()),
+                    _ => last_err = format!("part {number}: storage returned no ETag"),
+                }
+            }
+            Ok(Ok(res)) => last_err = format!("part {number}: storage error {}", res.status()),
+            Ok(Err(e)) => last_err = format!("part {number}: {e}"),
+            Err(_) => last_err = format!("part {number}: timed out after {} s", deadline.as_secs()),
+        }
+        eprintln!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
+    }
+    Err(format!("Upload failed at part {number}: {last_err}"))
 }

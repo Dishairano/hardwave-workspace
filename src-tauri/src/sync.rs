@@ -609,10 +609,8 @@ impl SyncEngine {
                 let sha = sha.clone();
                 let full_path = full_path.clone();
                 Box::pin(async move {
-                    let u = api::init_upload(&token, &ws_id, &filename, file_size, folder.as_deref(), &sha).await?;
-                    api::upload_to_s3(&u.upload_url, &full_path).await?;
-                    api::register_upload(&token, &ws_id, &u.file_id).await?;
-                    Ok::<_, String>((u.file_id, ws_id))
+                    let file_id = api::upload_file(&token, &ws_id, &filename, file_size, folder.as_deref(), &sha, &full_path).await?;
+                    Ok::<_, String>((file_id, ws_id))
                 })
             }
         }, 2).await?;
@@ -981,10 +979,8 @@ impl SyncEngine {
                                 let local_path = local_path.clone();
                                 let full_rel = full_rel.clone();
                                 Box::pin(async move {
-                                    let up = api::init_upload(&token, &ws_id, &filename, size, folder.as_deref(), &sha).await?;
-                                    api::upload_to_s3(&up.upload_url, &local_path).await?;
-                                    api::register_upload(&token, &ws_id, &up.file_id).await?;
-                                    Ok::<_, String>((full_rel.clone(), sha.clone(), size, up.file_id, ws_id.clone()))
+                                    let file_id = api::upload_file(&token, &ws_id, &filename, size, folder.as_deref(), &sha, &local_path).await?;
+                                    Ok::<_, String>((full_rel.clone(), sha.clone(), size, file_id, ws_id.clone()))
                                 })
                             }
                         }, 2).await?;
@@ -1296,10 +1292,8 @@ pub async fn archive_folder(
 
             let outcome = async {
                 let sha = hash_file(&path).map_err(|e| format!("unreadable ({e})"))?;
-                let up = api::init_upload(&token, &ws_id, &name, size, Some(&folder_path), &sha).await?;
-                api::upload_to_s3(&up.upload_url, &path).await?;
-                // Only Ok once the server has confirmed the object exists.
-                api::register_upload(&token, &ws_id, &up.file_id).await?;
+                // Only Ok once the server has marked the file ready.
+                api::upload_file(&token, &ws_id, &name, size, Some(&folder_path), &sha, &path).await?;
                 Ok::<(), String>(())
             }
             .await;
