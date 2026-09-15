@@ -1154,12 +1154,27 @@ pub fn free_up_space() -> Result<(u32, u64), String> {
         };
         // Modified since upload? Leave it: the server copy is stale, so the
         // local bytes are the only current ones.
-        match hash_file(&path) {
-            Ok(h) if h == entry.sha256 => {}
-            _ => { skipped += 1; continue; }
+        //
+        // Size and mtime first, the same shortcut the upload scan uses. Hashing
+        // every file here meant reading the whole sync root before a single byte
+        // was freed: on a 200 GB folder that is an hour of disk with nothing to
+        // show, which reads as "the button did nothing". Only a file whose mtime
+        // moved, or which never carried one, is worth a SHA-256.
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if size != entry.size {
+            skipped += 1;
+            continue;
+        }
+        match (entry.mtime, file_mtime(&path)) {
+            // Same size and mtime as recorded: unchanged, no hash needed.
+            (Some(recorded), Some(now)) if recorded == now => {}
+            // Anything else is a possible edit, so fall back to the hash.
+            _ => match hash_file(&path) {
+                Ok(h) if h == entry.sha256 => {}
+                _ => { skipped += 1; continue; }
+            },
         }
 
-        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
         match crate::cloudfiles::dehydrate(&path, &format!("{}/{}", ws_id, file_id)) {
             Ok(()) => { freed_files += 1; freed_bytes += size; }
             Err(e) => {
