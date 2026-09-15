@@ -724,9 +724,26 @@ impl SyncEngine {
                 }).collect()
             };
 
-            // Process downloads without holding the index lock
+            // Process downloads without holding the index lock.
+            //
+            // Flushed in batches, NOT only at the end: reconciling a big
+            // workspace hashes every local file that is not yet indexed, and
+            // writing the results once at the end meant an interrupted pass
+            // (app closed, sleep, network) threw all of it away and started
+            // from nothing next time. On a 136k-file workspace that pass never
+            // reached the end, so the index stayed near-empty for months and
+            // Free Up Space had almost nothing it was allowed to touch.
+            const INDEX_FLUSH_EVERY: usize = 200;
             let mut downloaded: Vec<SyncEntry> = Vec::new();
+            let mut pending_flush: Vec<SyncEntry> = Vec::new();
             for (rel_path, rf) in &to_download {
+                if pending_flush.len() >= INDEX_FLUSH_EVERY {
+                    let mut idx = self.index.lock().await;
+                    for e in pending_flush.drain(..) {
+                        idx.insert(e.rel_path.clone(), e);
+                    }
+                    write_index(&idx);
+                }
                 let local_path = root.join(rel_path);
 
                 // Conflict: file exists locally but not indexed
@@ -734,7 +751,7 @@ impl SyncEngine {
                     let local_hash = hash_file(&local_path).unwrap_or_default();
                     if rf.sha256.as_deref() == Some(&local_hash) {
                         eprintln!("[Sync] Already exists (same hash): {}", rel_path);
-                        downloaded.push(SyncEntry {
+                        let entry = SyncEntry {
                             rel_path: rel_path.clone(),
                             sha256: local_hash,
                             modified: chrono::Utc::now().to_rfc3339(),
@@ -742,7 +759,9 @@ impl SyncEngine {
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
                             mtime: file_mtime(&local_path),
-                        });
+                        };
+                        pending_flush.push(entry.clone());
+                        downloaded.push(entry);
                         continue;
                     }
                     self.emit_conflict(rel_path, local_path.metadata().map(|m| m.len()).unwrap_or(0), rf.size);
@@ -768,7 +787,7 @@ impl SyncEngine {
                     match crate::cloudfiles::create_placeholders(&root, dir, &[ph]) {
                         Ok(n) if n > 0 => {
                             eprintln!("[Sync] Placeholder: {}", rel_path);
-                            downloaded.push(SyncEntry {
+                            let entry = SyncEntry {
                                 rel_path: rel_path.clone(),
                                 // The remote hash is authoritative until the
                                 // file is hydrated and edited locally.
@@ -781,7 +800,9 @@ impl SyncEngine {
                                 // scan skips it by size+mtime and never hashes
                                 // (which would hydrate) a cloud-only file.
                                 mtime: file_mtime(&local_path),
-                            });
+                            };
+                            pending_flush.push(entry.clone());
+                            downloaded.push(entry);
                             self.emit_file_progress(rel_path, "placeholder", 100);
                             continue;
                         }
@@ -841,7 +862,7 @@ impl SyncEngine {
                 }
             }
 
-            // Update index with downloaded files (brief lock)
+            // Whatever the batch flush above has not written yet.
             if !downloaded.is_empty() {
                 let mut idx = self.index.lock().await;
                 for e in &downloaded {
@@ -1118,6 +1139,85 @@ impl Drop for SyncGuard<'_> {
     }
 }
 
+/// Fill in index entries for local files the server already holds.
+///
+/// Matches a local file to a remote one by path AND size, then confirms with
+/// SHA-256 before recording it. The hash is what makes dehydrating safe: it
+/// proves the bytes on the server are the bytes on disk, so discarding the
+/// local copy loses nothing. A file that does not match is left alone and
+/// stays fully on disk.
+///
+/// Results are written to the index in batches, so an interrupted run keeps
+/// everything it has already proven.
+async fn reconcile_from_server(
+    engine: &Arc<SyncEngine>,
+    root: &Path,
+    index: &mut HashMap<String, SyncEntry>,
+) -> Result<u32, String> {
+    let token = engine.token.read().await.clone().ok_or_else(|| "not signed in".to_string())?;
+    let workspaces = crate::api::list_workspaces(&token).await?;
+    let mut added = 0u32;
+
+    for ws in workspaces {
+        let files = match crate::api::list_files(&token, &ws.id).await {
+            Ok(f) => f,
+            Err(e) => { eprintln!("[FreeSpace] list '{}': {e}", ws.name); continue; }
+        };
+
+        for rf in files {
+            let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
+            let rel_path = if folder.is_empty() {
+                format!("{}/{}", ws.name, rf.name)
+            } else {
+                format!("{}/{}/{}", ws.name, folder, rf.name)
+            };
+
+            // Already known and usable.
+            if let Some(e) = index.get(&rel_path) {
+                if e.remote_id.is_some() && e.workspace_id.is_some() {
+                    continue;
+                }
+            }
+
+            let path = root.join(&rel_path);
+            if !path.is_file() || crate::cloudfiles::is_placeholder(&path) {
+                continue;
+            }
+            // Different size is a different file. Cheap, and it rules out most
+            // mismatches before any hashing.
+            let size = match path.metadata() { Ok(m) => m.len(), Err(_) => continue };
+            if size != rf.size {
+                continue;
+            }
+            let Some(remote_sha) = rf.sha256.as_deref() else { continue };
+            match hash_file(&path) {
+                Ok(h) if h == remote_sha => {}
+                _ => continue,
+            }
+
+            index.insert(rel_path.clone(), SyncEntry {
+                rel_path: rel_path.clone(),
+                sha256: remote_sha.to_string(),
+                modified: rf.updated_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                size,
+                remote_id: Some(rf.id.clone()),
+                workspace_id: Some(ws.id.clone()),
+                mtime: file_mtime(&path),
+            });
+            added += 1;
+            if added % 200 == 0 {
+                write_index(index);
+                eprintln!("[FreeSpace] reconciled {added} so far");
+            }
+        }
+    }
+
+    if added > 0 {
+        write_index(index);
+    }
+    Ok(added)
+}
+
 /// Convert every already-uploaded local file into a dehydrated placeholder.
 ///
 /// The OneDrive "Free up space" behaviour. Files stay visible and openable;
@@ -1127,12 +1227,28 @@ impl Drop for SyncGuard<'_> {
 /// the server holds it AND the local hash still matches what was uploaded. An
 /// unsynced or locally-modified file is skipped, because dehydrating one would
 /// destroy the only copy.
-pub fn free_up_space() -> Result<(u32, u64), String> {
+pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64), String> {
     if !crate::cloudfiles::is_supported() {
         return Err("Files On-Demand is not available on this system".into());
     }
     let root = sync_root();
-    let index = read_index();
+    let mut index = read_index();
+
+    // The index is a cache of what this machine happens to have reconciled, not
+    // the truth about what the server holds. On a large workspace it can be far
+    // behind (one machine had 1,459 entries against 136,313 files on the
+    // server), and every file missing from it was skipped here -- so Free Up
+    // Space reported nothing to free while 198 GB sat on disk with a copy
+    // already safe on the server. Ask the server first, and reconcile as we go.
+    if let Some(engine) = engine {
+        match reconcile_from_server(&engine, &root, &mut index).await {
+            Ok(added) if added > 0 => eprintln!("[FreeSpace] reconciled {added} files against the server"),
+            Ok(_) => {}
+            // A reconcile that fails must not stop us freeing what the index
+            // already proves. It only ever adds entries.
+            Err(e) => eprintln!("[FreeSpace] could not reach the server ({e}); using the local index only"),
+        }
+    }
     let mut freed_files = 0u32;
     let mut freed_bytes = 0u64;
     let mut skipped = 0u32;

@@ -459,8 +459,15 @@ pub fn run() {
                             // the menu callback thread.
                             let app = app.clone();
                             std::thread::spawn(move || {
-                                let msg = match sync::free_up_space() {
-                                    Ok((0, _)) => "Nothing to free up: every synced file is already a placeholder.".to_string(),
+                                // The engine carries the signed-in token, which
+                                // is what lets this ask the server which files
+                                // it already holds instead of trusting an index
+                                // that may be far behind.
+                                let engine = tauri::async_runtime::block_on(async {
+                                    app.state::<AppState>().sync_engine.lock().await.clone()
+                                });
+                                let msg = match tauri::async_runtime::block_on(sync::free_up_space(engine)) {
+                                    Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or the rest are not on the server yet.".to_string(),
                                     Ok((n, b)) => format!(
                                         "Freed {:.2} GB across {} files. They stay in Explorer and download again when opened.",
                                         b as f64 / 1_073_741_824.0, n),
