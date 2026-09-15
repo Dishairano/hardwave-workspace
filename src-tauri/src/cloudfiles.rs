@@ -35,6 +35,13 @@ mod imp {
     use super::*;
 
     pub fn is_supported() -> bool { false }
+    pub fn with_conversion_policy<T>(
+        _root: &Path,
+        _provider_name: &str,
+        work: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        Ok(work())
+    }
     pub fn register(_root: &Path, _provider_id: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
@@ -77,7 +84,30 @@ mod imp {
 
     /// Claim a directory tree as ours. Safe to call repeatedly: the UPDATE flag
     /// re-registers rather than failing on an existing root.
+    /// Re-register the sync root with the population policy that allows converting ordinary files
+    /// into placeholders, run `work`, then put the normal policy back whatever happens.
+    ///
+    /// Under ALWAYS_FULL the platform treats the namespace as complete and refuses
+    /// CfConvertToPlaceholder with 0x8007017C, which is why Free Up Space could not free a single
+    /// ordinary file: 95,610 refusals against 20 successes, the 20 being files that were already
+    /// placeholders and only needed dehydrating.
+    pub fn with_conversion_policy<T>(
+        root: &Path,
+        provider_name: &str,
+        work: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        register_with(root, provider_name, CF_POPULATION_POLICY_FULL.0)?;
+        let out = work();
+        // Put ALWAYS_FULL back even if the work panicked its way out; Explorer crawls without it.
+        register_with(root, provider_name, CF_POPULATION_POLICY_ALWAYS_FULL.0)?;
+        Ok(out)
+    }
+
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
+        register_with(root, provider_name, CF_POPULATION_POLICY_ALWAYS_FULL.0)
+    }
+
+    fn register_with(root: &Path, provider_name: &str, population: i32) -> Result<(), String> {
         std::fs::create_dir_all(root).map_err(|e| format!("create sync root: {e}"))?;
 
         let root_w = wide(&root.to_string_lossy());
@@ -120,7 +150,7 @@ mod imp {
             // open sat waiting for the timeout. ALWAYS_FULL tells the platform
             // never to forward enumeration at all.
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0),
+                Primary: CF_POPULATION_POLICY_PRIMARY(population),
                 Modifier: CF_POPULATION_POLICY_MODIFIER(0),
             },
             InSync: CF_INSYNC_POLICY_TRACK_ALL,
@@ -310,4 +340,7 @@ mod imp {
 }
 
 #[allow(unused_imports)]
-pub use imp::{create_placeholders, dehydrate, is_placeholder, is_supported, register, unregister};
+pub use imp::{
+    create_placeholders, dehydrate, is_placeholder, is_supported, register, unregister,
+    with_conversion_policy,
+};
