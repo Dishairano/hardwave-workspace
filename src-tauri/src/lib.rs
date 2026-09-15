@@ -144,6 +144,25 @@ pub fn free_up_space_cli() {
     report_free_up(&message);
 }
 
+/// Register the Hardwave folder as a cloud sync root again, and say what happened.
+pub fn register_sync_root_cli() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        )
+        .ok();
+    }
+    let root = sync::sync_root();
+    match cloudfiles::register(&root, "Hardwave Workspace") {
+        Ok(()) => report_free_up(&format!("Registered {} as a cloud folder again.", root.display())),
+        Err(e) => {
+            report_free_up(&format!("Could not register {}: {e}", root.display()));
+            std::process::exit(1);
+        }
+    }
+}
+
 fn report_free_up(message: &str) {
     println!("{message}");
     let path = std::env::temp_dir().join("hardwave-freeup.txt");
