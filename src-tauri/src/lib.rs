@@ -114,20 +114,9 @@ pub fn free_up_space_cli() {
         }
     };
 
-    // Converting ordinary files needs the sync root's population policy relaxed for the duration
-    // (see cloudfiles::with_conversion_policy), and the policy is put back before this returns.
-    let outcome = cloudfiles::with_conversion_policy(&sync::sync_root(), "Hardwave Workspace", || {
-        runtime.block_on(sync::free_up_space(None))
-    });
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            report_free_up(&format!("Could not set the sync root policy: {e}"));
-            std::process::exit(1);
-        }
-    };
-
-    let message = match outcome {
+    // No policy switching here: re-registering the root with CF_POPULATION_POLICY_FULL is itself
+    // refused with 0x8007017C, so that idea is dead. Run with the root exactly as the app leaves it.
+    let message = match runtime.block_on(sync::free_up_space(None)) {
         Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or \
                        the rest are not on the server yet."
             .to_string(),
