@@ -39,3 +39,23 @@ jobs:
           name: hardwave-workspace-exe
           path: src-tauri/target/release/hardwave-workspace.exe
           if-no-files-found: error
+
+  link:
+    name: hw-link.exe
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: tools/hw-link
+        run: cargo build --release
+
+      - name: Upload the exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hw-link-exe
+          path: tools/hw-link/target/release/hw-link.exe
+          if-no-files-found: error

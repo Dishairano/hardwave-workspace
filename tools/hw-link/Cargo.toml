@@ -1,0 +1,11 @@
+[package]
+name = "hw-link"
+version = "0.1.0"
+edition = "2021"
+description = "Holds the reverse SSH tunnel from the founder's PC to HQ so support can reach the machine."
+
+[dependencies]
+
+[profile.release]
+strip = true
+opt-level = "z"
