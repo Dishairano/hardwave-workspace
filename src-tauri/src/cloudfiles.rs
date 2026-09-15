@@ -256,20 +256,39 @@ mod imp {
         }
         .map_err(|e| format!("open {}: {e}", path.display()))?;
 
-        // MARK_IN_SYNC asserts the server copy is current, which DEHYDRATE
-        // requires before it will discard the local bytes.
-        let res = unsafe {
-            CfConvertToPlaceholder(
-                handle,
-                Some(ident_w.as_ptr() as *const c_void),
-                (ident_w.len() * 2) as u32,
-                CF_CONVERT_FLAG_MARK_IN_SYNC | CF_CONVERT_FLAG_DEHYDRATE,
-                None,
-                None,
-            )
+        // Two steps, not one. CF_CONVERT_FLAG_DEHYDRATE only applies to a file that is ALREADY a
+        // placeholder; passing it while converting an ordinary file fails the whole call with
+        // 0x8007017C ("the cloud operation is invalid"). That is what Free Up Space was doing on
+        // every ordinary file: on the founder's machine 95,611 files were refused and 20 freed,
+        // the 20 being the ones that happened to be placeholders already.
+        //
+        // So: convert to a placeholder and mark it in sync (the platform will not drop local bytes
+        // it believes are newer than the server's), then dehydrate that placeholder.
+        let already = is_placeholder(path);
+        let converted = if already {
+            Ok(())
+        } else {
+            unsafe {
+                CfConvertToPlaceholder(
+                    handle,
+                    Some(ident_w.as_ptr() as *const c_void),
+                    (ident_w.len() * 2) as u32,
+                    CF_CONVERT_FLAG_MARK_IN_SYNC,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|e| err(e.code(), "CfConvertToPlaceholder"))
         };
+
+        let res = converted.and_then(|()| {
+            // Length -1 means the whole file.
+            unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE) }
+                .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
+        });
+
         unsafe { let _ = CloseHandle(handle); }
-        res.map_err(|e| err(e.code(), "CfConvertToPlaceholder"))
+        res
     }
 
     /// Is this path a placeholder we own, rather than a real file? Used to skip
