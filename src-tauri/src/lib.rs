@@ -88,6 +88,32 @@ pub fn free_up_space_cli() {
         }
     };
 
+    // Windows only lets the process that is CONNECTED to the sync root turn files into
+    // placeholders. Without this, every conversion comes back 0x8007017C ("the cloud operation
+    // is invalid") and nothing is freed, which is exactly what the first version of this command
+    // did on the founder's machine: 95,615 files attempted, 0 freed.
+    //
+    // Only one process can hold that connection, so the app must be closed while this runs.
+    // Hydration requests that arrive meanwhile are refused: nothing should be opening these
+    // files with the app shut, and refusing is safer than serving bytes with no token.
+    #[cfg(target_os = "windows")]
+    let _connection = {
+        let root = sync::sync_root();
+        let fetcher: hydration::Fetcher = std::sync::Arc::new(|_identity, _offset, _length| {
+            Box::pin(async { Err("Hardwave Workspace is not running".to_string()) })
+        });
+        match runtime.block_on(async { hydration::connect(&root, fetcher) }) {
+            Ok(c) => c,
+            Err(e) => {
+                report_free_up(&format!(
+                    "Could not take over Files On-Demand ({e}). Close Hardwave Workspace \
+                     (right click the tray icon, Quit) and run this again."
+                ));
+                std::process::exit(1);
+            }
+        }
+    };
+
     let message = match runtime.block_on(sync::free_up_space(None)) {
         Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or \
                        the rest are not on the server yet."
