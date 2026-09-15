@@ -61,6 +61,56 @@ fn load_saved_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Free Up Space from the command line, without starting the interface.
+///
+/// The tray action hands `free_up_space` the running engine so it can ask the server what it
+/// holds. Here there is no engine, so it works from the sync index on disk, which is exactly
+/// what the tray action falls back to when the server is unreachable. Everything the index
+/// lists as uploaded becomes a placeholder; anything still uploading is left alone.
+///
+/// The result goes to stdout AND to `%TEMP%\\hardwave-freeup.txt`, because the release build is
+/// a windows subsystem binary: started from a shell it has no console to print to.
+pub fn free_up_space_cli() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // Borrow the calling shell's console so the output is visible when run by hand.
+        windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        )
+        .ok();
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            report_free_up(&format!("Could not start: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let message = match runtime.block_on(sync::free_up_space(None)) {
+        Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or \
+                       the rest are not on the server yet."
+            .to_string(),
+        Ok((files, bytes)) => format!(
+            "Freed {:.2} GB across {} files. They stay in Explorer and download again when opened.",
+            bytes as f64 / 1_073_741_824.0,
+            files
+        ),
+        Err(e) => {
+            report_free_up(&format!("Could not free up space: {e}"));
+            std::process::exit(1);
+        }
+    };
+    report_free_up(&message);
+}
+
+fn report_free_up(message: &str) {
+    println!("{message}");
+    let path = std::env::temp_dir().join("hardwave-freeup.txt");
+    let _ = std::fs::write(&path, format!("{message}\n"));
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────────────
 
 #[tauri::command]
