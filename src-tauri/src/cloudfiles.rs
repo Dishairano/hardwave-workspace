@@ -283,7 +283,7 @@ mod imp {
 
         let res = converted.and_then(|()| {
             // Length -1 means the whole file.
-            unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE) }
+            unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
                 .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
         });
 
