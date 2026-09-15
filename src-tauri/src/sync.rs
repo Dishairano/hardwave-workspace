@@ -1205,7 +1205,7 @@ async fn reconcile_from_server(
                 mtime: file_mtime(&path),
             });
             added += 1;
-            if added % 200 == 0 {
+            if added.is_multiple_of(200) {
                 write_index(index);
                 eprintln!("[FreeSpace] reconciled {added} so far");
             }
