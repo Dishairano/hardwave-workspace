@@ -37,6 +37,20 @@ pub struct SyncEntry {
     /// files (which lack it) still load and simply fall back to hashing once.
     #[serde(default)]
     pub mtime: Option<i64>,
+    /// Whether `sha256` has been checked against the bytes on this disk.
+    ///
+    /// False only for a match recorded from metadata against a server file,
+    /// without reading the local file (`sync::trust_without_hash`). Such an
+    /// entry still skips re-upload, but Free Up Space hashes the file before it
+    /// discards any bytes. Defaults to true: every entry written before this
+    /// flag existed came from a real hash or from bytes downloaded from the
+    /// server.
+    #[serde(default = "verified_by_default")]
+    pub verified: bool,
+}
+
+fn verified_by_default() -> bool {
+    true
 }
 
 /// State pushed to the frontend via events.
@@ -66,4 +80,14 @@ pub struct SyncStatus {
     pub current_percent: u32,
 }
 
+#[cfg(test)]
+mod sync_entry_tests {
+    use super::*;
 
+    #[test]
+    fn index_entries_from_before_the_flag_load_as_verified() {
+        let json = r#"{"rel_path":"ws/kick.wav","sha256":"ab","modified":"t","size":1,"remote_id":"1","workspace_id":"2"}"#;
+        let entry: SyncEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.verified);
+    }
+}

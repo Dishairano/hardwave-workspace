@@ -87,6 +87,80 @@ fn file_mtime(path: &Path) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
+/// Whether a local file can be matched to a server file without reading it.
+///
+/// Hashing every unindexed local file before matching it meant reading up to
+/// ~200 GB, one file at a time, before a big workspace finished its first pass,
+/// and it hydrated any cloud-only placeholder it touched. This decides from
+/// metadata alone, and only in the safe direction: exact same size (the caller
+/// has already matched the path), a server checksum to record, and a local
+/// modified time no later than when the server row was created. A file changed
+/// after that, such as a stem re-bounced to the same length, has a newer mtime
+/// and falls through to the upload scan, which hashes it.
+///
+/// The entry this produces is marked unverified; Free Up Space hashes the file
+/// before discarding its bytes.
+pub(crate) fn trust_without_hash(
+    local_size: u64,
+    local_mtime: Option<i64>,
+    remote_size: u64,
+    remote_sha: Option<&str>,
+    remote_created_at: Option<&str>,
+) -> bool {
+    if local_size != remote_size || remote_sha.is_none_or(str::is_empty) {
+        return false;
+    }
+    match (local_mtime, remote_created_at.and_then(parse_server_time)) {
+        (Some(modified), Some(created)) => modified <= created,
+        _ => false,
+    }
+}
+
+/// Server timestamps arrive as ISO 8601 in UTC. Anything else is treated as
+/// unknown, which makes `trust_without_hash` refuse rather than guess.
+fn parse_server_time(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp())
+}
+
+#[cfg(test)]
+mod trust_without_hash_tests {
+    use super::*;
+
+    const CREATED: &str = "2026-09-01T10:00:00.000Z";
+
+    fn created() -> i64 {
+        parse_server_time(CREATED).unwrap()
+    }
+
+    #[test]
+    fn unchanged_since_upload_is_trusted() {
+        assert!(trust_without_hash(10, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
+    }
+
+    #[test]
+    fn edited_after_upload_is_not_trusted_even_at_the_same_size() {
+        assert!(!trust_without_hash(10, Some(created() + 60), 10, Some("ab"), Some(CREATED)));
+    }
+
+    #[test]
+    fn different_size_is_not_trusted() {
+        assert!(!trust_without_hash(11, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
+    }
+
+    #[test]
+    fn no_server_checksum_is_not_trusted() {
+        assert!(!trust_without_hash(10, Some(created() - 60), 10, None, Some(CREATED)));
+        assert!(!trust_without_hash(10, Some(created() - 60), 10, Some(""), Some(CREATED)));
+    }
+
+    #[test]
+    fn unknown_times_are_not_trusted() {
+        assert!(!trust_without_hash(10, None, 10, Some("ab"), Some(CREATED)));
+        assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), Some("2026-09-01 10:00:00")));
+        assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), None));
+    }
+}
+
 /// What the upload scan should do with one local file — decided from size,
 /// mtime and whether it is already uploaded, no hashing, so the scan never
 /// blocks the sync loop on I/O.
@@ -628,6 +702,7 @@ impl SyncEngine {
                 remote_id: Some(upload.0),
                 workspace_id: Some(upload.1),
                 mtime: file_mtime(&full_path),
+                verified: true,
             });
             write_index(&index);
         }
@@ -746,25 +821,39 @@ impl SyncEngine {
                 }
                 let local_path = root.join(rel_path);
 
-                // Conflict: file exists locally but not indexed
+                // The file exists locally but is not indexed yet. Matched from
+                // metadata, never by hashing here (see trust_without_hash):
+                // hashing was the hour-long first pass, and it hydrated any
+                // cloud-only placeholder it read. A file that does not qualify
+                // stays unindexed; the upload scan hashes it once, and the
+                // server recognises identical bytes without a transfer.
                 if local_path.exists() {
-                    let local_hash = hash_file(&local_path).unwrap_or_default();
-                    if rf.sha256.as_deref() == Some(&local_hash) {
-                        eprintln!("[Sync] Already exists (same hash): {}", rel_path);
+                    let local_size = local_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let local_mtime = file_mtime(&local_path);
+                    if trust_without_hash(
+                        local_size,
+                        local_mtime,
+                        rf.size,
+                        rf.sha256.as_deref(),
+                        rf.created_at.as_deref(),
+                    ) {
                         let entry = SyncEntry {
                             rel_path: rel_path.clone(),
-                            sha256: local_hash,
+                            sha256: rf.sha256.clone().unwrap_or_default(),
                             modified: chrono::Utc::now().to_rfc3339(),
-                            size: local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                            size: local_size,
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
-                            mtime: file_mtime(&local_path),
+                            mtime: local_mtime,
+                            verified: false,
                         };
                         pending_flush.push(entry.clone());
                         downloaded.push(entry);
                         continue;
                     }
-                    self.emit_conflict(rel_path, local_path.metadata().map(|m| m.len()).unwrap_or(0), rf.size);
+                    if local_size != rf.size {
+                        self.emit_conflict(rel_path, local_size, rf.size);
+                    }
                     continue;
                 }
 
@@ -800,6 +889,7 @@ impl SyncEngine {
                                 // scan skips it by size+mtime and never hashes
                                 // (which would hydrate) a cloud-only file.
                                 mtime: file_mtime(&local_path),
+                                verified: true,
                             };
                             pending_flush.push(entry.clone());
                             downloaded.push(entry);
@@ -853,6 +943,7 @@ impl SyncEngine {
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
                             mtime: file_mtime(&root.join(rel_path.as_str())),
+                            verified: true,
                         });
                         self.emit_file_progress(rel_path, "download", 100);
                     }
@@ -1023,6 +1114,7 @@ impl SyncEngine {
                                 remote_id: Some(file_id),
                                 workspace_id: Some(ws_id),
                                 mtime: entry_mtime,
+                                verified: true,
                             });
                         }
                         Ok(Err(e)) => eprintln!("[Sync] Upload failed: {}", e),
@@ -1139,29 +1231,48 @@ impl Drop for SyncGuard<'_> {
     }
 }
 
-/// Fill in index entries for local files the server already holds.
+/// A file Free Up Space may convert to a placeholder, once proven.
+struct FreeCandidate {
+    rel_path: String,
+    path: PathBuf,
+    identity: String,
+    size: u64,
+    expected_sha: String,
+    /// Hash before discarding. False only for an entry that is verified AND
+    /// unchanged since (same size and mtime as recorded).
+    needs_hash: bool,
+    /// Index entry to record once freed, for a server match the index did not
+    /// have yet. None for files already in the index.
+    new_entry: Option<SyncEntry>,
+}
+
+/// Match local files the index does not know against what the server holds.
 ///
-/// Matches a local file to a remote one by path AND size, then confirms with
-/// SHA-256 before recording it. The hash is what makes dehydrating safe: it
-/// proves the bytes on the server are the bytes on disk, so discarding the
-/// local copy loses nothing. A file that does not match is left alone and
-/// stays fully on disk.
+/// Metadata only, no hashing, so this takes seconds rather than hours:
+/// - a file that passes `trust_without_hash` becomes an unverified index entry;
+/// - a file with the same size and a server checksum that does not pass (it is
+///   newer, or times are unknown) becomes a hash candidate. It is NOT indexed
+///   yet, because an index entry would make the upload scan skip a real edit.
 ///
-/// Results are written to the index in batches, so an interrupted run keeps
-/// everything it has already proven.
+/// Nothing is discarded here. `free_up_space` hashes every unverified or
+/// changed file before converting it.
 async fn reconcile_from_server(
     engine: &Arc<SyncEngine>,
     root: &Path,
-    index: &mut HashMap<String, SyncEntry>,
-) -> Result<u32, String> {
+    index: &HashMap<String, SyncEntry>,
+) -> Result<(Vec<SyncEntry>, Vec<FreeCandidate>), String> {
     let token = engine.token.read().await.clone().ok_or_else(|| "not signed in".to_string())?;
     let workspaces = crate::api::list_workspaces(&token).await?;
-    let mut added = 0u32;
+    let mut trusted = Vec::new();
+    let mut to_hash = Vec::new();
 
     for ws in workspaces {
         let files = match crate::api::list_files(&token, &ws.id).await {
             Ok(f) => f,
-            Err(e) => { eprintln!("[FreeSpace] list '{}': {e}", ws.name); continue; }
+            Err(e) => {
+                eprintln!("[FreeSpace] list '{}': {e}", ws.name);
+                continue;
+            }
         };
 
         for rf in files {
@@ -1173,93 +1284,118 @@ async fn reconcile_from_server(
             };
 
             // Already known and usable.
-            if let Some(e) = index.get(&rel_path) {
-                if e.remote_id.is_some() && e.workspace_id.is_some() {
-                    continue;
-                }
+            if index.get(&rel_path).is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some()) {
+                continue;
             }
 
             let path = root.join(&rel_path);
             if !path.is_file() || crate::cloudfiles::is_placeholder(&path) {
                 continue;
             }
-            // Different size is a different file. Cheap, and it rules out most
-            // mismatches before any hashing.
-            let size = match path.metadata() { Ok(m) => m.len(), Err(_) => continue };
+            let size = match path.metadata() {
+                Ok(m) => m.len(),
+                Err(_) => continue,
+            };
+            let Some(remote_sha) = rf.sha256.as_deref().filter(|s| !s.is_empty()) else {
+                continue;
+            };
             if size != rf.size {
                 continue;
             }
-            let Some(remote_sha) = rf.sha256.as_deref() else { continue };
-            match hash_file(&path) {
-                Ok(h) if h == remote_sha => {}
-                _ => continue,
-            }
-
-            index.insert(rel_path.clone(), SyncEntry {
+            let mtime = file_mtime(&path);
+            let entry = SyncEntry {
                 rel_path: rel_path.clone(),
                 sha256: remote_sha.to_string(),
                 modified: rf.updated_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 size,
                 remote_id: Some(rf.id.clone()),
                 workspace_id: Some(ws.id.clone()),
-                mtime: file_mtime(&path),
-            });
-            added += 1;
-            if added.is_multiple_of(200) {
-                write_index(index);
-                eprintln!("[FreeSpace] reconciled {added} so far");
+                mtime,
+                verified: false,
+            };
+
+            if trust_without_hash(size, mtime, rf.size, Some(remote_sha), rf.created_at.as_deref()) {
+                trusted.push(entry);
+            } else {
+                to_hash.push(FreeCandidate {
+                    rel_path,
+                    path,
+                    identity: format!("{}/{}", ws.id, rf.id),
+                    size,
+                    expected_sha: remote_sha.to_string(),
+                    needs_hash: true,
+                    // Recorded only after the hash proves it, and then as verified.
+                    new_entry: Some(SyncEntry { verified: true, ..entry }),
+                });
             }
         }
     }
-
-    if added > 0 {
-        write_index(index);
-    }
-    Ok(added)
+    Ok((trusted, to_hash))
 }
+
+/// How many files Free Up Space hashes and converts at once.
+const FREE_SPACE_PARALLEL: usize = 4;
 
 /// Convert every already-uploaded local file into a dehydrated placeholder.
 ///
 /// The OneDrive "Free up space" behaviour. Files stay visible and openable;
 /// only their bytes go, and opening one pulls it back.
 ///
-/// Deliberately conservative: a file is only touched when the sync index says
-/// the server holds it AND the local hash still matches what was uploaded. An
-/// unsynced or locally-modified file is skipped, because dehydrating one would
-/// destroy the only copy.
+/// Never discards unproven bytes: a file is converted only when the server
+/// holds it AND its contents are proven identical, either by a hash taken now
+/// or by a verified index entry whose size and mtime have not changed since.
+/// An unsynced or modified file keeps its bytes, because converting it would
+/// destroy the only current copy.
+///
+/// Hashing happens here, per file, right before freeing it, several files at a
+/// time, instead of up front in the sync pass.
 pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64), String> {
+    use futures_util::stream::{self, StreamExt};
+
     if !crate::cloudfiles::is_supported() {
         return Err("Files On-Demand is not available on this system".into());
     }
     let root = sync_root();
-    let mut index = read_index();
 
-    // The index is a cache of what this machine happens to have reconciled, not
-    // the truth about what the server holds. On a large workspace it can be far
-    // behind (one machine had 1,459 entries against 136,313 files on the
-    // server), and every file missing from it was skipped here -- so Free Up
-    // Space reported nothing to free while 198 GB sat on disk with a copy
-    // already safe on the server. Ask the server first, and reconcile as we go.
-    if let Some(engine) = engine {
-        match reconcile_from_server(&engine, &root, &mut index).await {
-            Ok(added) if added > 0 => eprintln!("[FreeSpace] reconciled {added} files against the server"),
-            Ok(_) => {}
-            // A reconcile that fails must not stop us freeing what the index
-            // already proves. It only ever adds entries.
+    // Work from the running engine's index when there is one. Reading and
+    // writing the file on disk behind its back let the engine's next flush
+    // overwrite everything recorded here.
+    let mut index = match &engine {
+        Some(e) => e.index.lock().await.clone(),
+        None => read_index(),
+    };
+
+    let mut updates: Vec<SyncEntry> = Vec::new();
+    let mut candidates: Vec<FreeCandidate> = Vec::new();
+
+    // The index is a cache of what this machine has reconciled, not the truth
+    // about the server. On a large workspace it can be far behind (one machine
+    // had 1,459 entries against 136,313 server files), and every file missing
+    // from it used to be skipped. Ask the server first.
+    if let Some(engine) = &engine {
+        match reconcile_from_server(engine, &root, &index).await {
+            Ok((trusted, to_hash)) => {
+                eprintln!(
+                    "[FreeSpace] matched {} files by metadata, {} more need a hash",
+                    trusted.len(),
+                    to_hash.len()
+                );
+                for e in trusted {
+                    index.insert(e.rel_path.clone(), e.clone());
+                    updates.push(e);
+                }
+                candidates.extend(to_hash);
+            }
+            // Only ever adds candidates; the index alone is still usable.
             Err(e) => eprintln!("[FreeSpace] could not reach the server ({e}); using the local index only"),
         }
     }
-    let mut freed_files = 0u32;
-    let mut freed_bytes = 0u64;
-    let mut skipped = 0u32;
 
+    let mut skipped = 0u32;
     for (rel_path, entry) in index.iter() {
         let path = root.join(rel_path);
-        if !path.is_file() {
-            continue;
-        }
         // Already dehydrated: nothing to reclaim.
-        if crate::cloudfiles::is_placeholder(&path) {
+        if !path.is_file() || crate::cloudfiles::is_placeholder(&path) {
             continue;
         }
         // Without both halves of the identity we cannot ask the server for the
@@ -1268,37 +1404,97 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
             skipped += 1;
             continue;
         };
-        // Modified since upload? Leave it: the server copy is stale, so the
-        // local bytes are the only current ones.
-        //
-        // Size and mtime first, the same shortcut the upload scan uses. Hashing
-        // every file here meant reading the whole sync root before a single byte
-        // was freed: on a 200 GB folder that is an hour of disk with nothing to
-        // show, which reads as "the button did nothing". Only a file whose mtime
-        // moved, or which never carried one, is worth a SHA-256.
-        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = match path.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         if size != entry.size {
             skipped += 1;
             continue;
         }
-        match (entry.mtime, file_mtime(&path)) {
-            // Same size and mtime as recorded: unchanged, no hash needed.
-            (Some(recorded), Some(now)) if recorded == now => {}
-            // Anything else is a possible edit, so fall back to the hash.
-            _ => match hash_file(&path) {
-                Ok(h) if h == entry.sha256 => {}
-                _ => { skipped += 1; continue; }
-            },
-        }
+        let unchanged = matches!((entry.mtime, file_mtime(&path)), (Some(a), Some(b)) if a == b);
+        candidates.push(FreeCandidate {
+            rel_path: rel_path.clone(),
+            path,
+            identity: format!("{ws_id}/{file_id}"),
+            size,
+            expected_sha: entry.sha256.clone(),
+            needs_hash: !entry.verified || !unchanged,
+            new_entry: None,
+        });
+    }
 
-        match crate::cloudfiles::dehydrate(&path, &format!("{}/{}", ws_id, file_id)) {
-            Ok(()) => { freed_files += 1; freed_bytes += size; }
+    // Hash (when needed) and convert, a few files at a time, off the async
+    // threads. A hash that does not match leaves the file fully on disk.
+    let results: Vec<(FreeCandidate, Result<bool, String>)> = stream::iter(candidates)
+        .map(|c| async move {
+            let path = c.path.clone();
+            let expected = c.expected_sha.clone();
+            let identity = c.identity.clone();
+            let needs_hash = c.needs_hash;
+            let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                if needs_hash {
+                    match hash_file(&path) {
+                        Ok(h) if h == expected => {}
+                        _ => return Ok(false),
+                    }
+                }
+                crate::cloudfiles::dehydrate(&path, &identity).map(|()| true)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
+            (c, outcome)
+        })
+        .buffer_unordered(FREE_SPACE_PARALLEL)
+        .collect()
+        .await;
+
+    let mut freed_files = 0u32;
+    let mut freed_bytes = 0u64;
+    for (c, outcome) in results {
+        match outcome {
+            Ok(true) => {
+                freed_files += 1;
+                freed_bytes += c.size;
+                // A freed file is proven: record it, or mark its entry verified.
+                let proven = match c.new_entry {
+                    Some(e) => Some(e),
+                    None => index.get(&c.rel_path).cloned().map(|mut e| {
+                        e.verified = true;
+                        e
+                    }),
+                };
+                updates.extend(proven);
+            }
+            Ok(false) => skipped += 1,
             Err(e) => {
-                eprintln!("[FreeSpace] {rel_path}: {e}");
+                eprintln!("[FreeSpace] {}: {e}", c.rel_path);
                 skipped += 1;
             }
         }
     }
+
+    if !updates.is_empty() {
+        match &engine {
+            Some(e) => {
+                let mut live = e.index.lock().await;
+                for u in updates {
+                    live.insert(u.rel_path.clone(), u);
+                }
+                write_index(&live);
+            }
+            None => {
+                for u in updates {
+                    index.insert(u.rel_path.clone(), u);
+                }
+                write_index(&index);
+            }
+        }
+    }
+
     eprintln!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
     Ok((freed_files, freed_bytes))
 }

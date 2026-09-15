@@ -245,16 +245,21 @@ struct RawUploadInit {
     file_id_camel: Option<serde_json::Value>,
     #[serde(rename = "file_id", default)]
     file_id_snake: Option<serde_json::Value>,
+    /// Set when the server already holds these exact bytes under a ready file.
+    #[serde(rename = "alreadyUploaded", default)]
+    already_uploaded: Option<bool>,
 }
 
 #[derive(Debug)]
 pub struct UploadInitResponse {
     pub upload_url: String,
     pub file_id: String,
+    pub already_uploaded: bool,
 }
 
 impl UploadInitResponse {
     fn from_raw(r: RawUploadInit) -> Result<Self, String> {
+        let already_uploaded = r.already_uploaded.unwrap_or(false);
         let upload_url = r
             .upload_url_camel
             .or(r.upload_url_snake)
@@ -269,7 +274,7 @@ impl UploadInitResponse {
             serde_json::Value::String(v) => v,
             other => return Err(format!("unexpected fileId: {other}")),
         };
-        Ok(Self { upload_url, file_id })
+        Ok(Self { upload_url, file_id, already_uploaded })
     }
 }
 
@@ -406,6 +411,11 @@ pub async fn upload_file(
 ) -> Result<String, String> {
     if size <= MULTIPART_THRESHOLD {
         let u = init_upload(token, workspace_id, filename, size, folder_path, sha256).await?;
+        // The server matched name, folder, size and SHA-256 against a ready file:
+        // those bytes are already stored, so there is nothing to send or register.
+        if u.already_uploaded {
+            return Ok(u.file_id);
+        }
         upload_to_s3(&u.upload_url, path).await?;
         register_upload(token, workspace_id, &u.file_id).await?;
         return Ok(u.file_id);
@@ -421,6 +431,8 @@ struct MultipartInit {
     storage_key: String,
     #[serde(rename = "fileId", deserialize_with = "id_from_json")]
     file_id: String,
+    #[serde(rename = "alreadyUploaded", default)]
+    already_uploaded: bool,
 }
 
 #[derive(Deserialize)]
@@ -468,6 +480,15 @@ async fn upload_multipart(
     let init: MultipartInit = serde_json::from_str(&text).map_err(|e| {
         format!("Multipart initiate returned an unexpected reply ({e}): {}", text.chars().take(200).collect::<String>())
     })?;
+
+    if init.already_uploaded {
+        // Identical bytes are already stored. The server still opens a multipart
+        // upload for older clients, so close it rather than leave it pending.
+        let _ = multipart_call(token, workspace_id, &serde_json::json!({
+            "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
+        })).await;
+        return Ok(init.file_id);
+    }
 
     let result = send_parts(token, workspace_id, &init, size, path).await;
     if let Err(e) = result {
