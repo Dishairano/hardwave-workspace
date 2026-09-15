@@ -96,18 +96,22 @@ mod imp {
         provider_name: &str,
         work: impl FnOnce() -> T,
     ) -> Result<T, String> {
-        register_with(root, provider_name, CF_POPULATION_POLICY_FULL.0)?;
+        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_FULL.0))?;
         let out = work();
         // Put ALWAYS_FULL back even if the work panicked its way out; Explorer crawls without it.
-        register_with(root, provider_name, CF_POPULATION_POLICY_ALWAYS_FULL.0)?;
+        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))?;
         Ok(out)
     }
 
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
-        register_with(root, provider_name, CF_POPULATION_POLICY_ALWAYS_FULL.0)
+        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))
     }
 
-    fn register_with(root: &Path, provider_name: &str, population: i32) -> Result<(), String> {
+    fn register_with(
+        root: &Path,
+        provider_name: &str,
+        population: CF_POPULATION_POLICY_PRIMARY,
+    ) -> Result<(), String> {
         std::fs::create_dir_all(root).map_err(|e| format!("create sync root: {e}"))?;
 
         let root_w = wide(&root.to_string_lossy());
@@ -150,7 +154,7 @@ mod imp {
             // open sat waiting for the timeout. ALWAYS_FULL tells the platform
             // never to forward enumeration at all.
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PRIMARY(population),
+                Primary: population,
                 Modifier: CF_POPULATION_POLICY_MODIFIER(0),
             },
             InSync: CF_INSYNC_POLICY_TRACK_ALL,
