@@ -1,3 +1,4 @@
+use futures_util::stream::StreamExt as _;
 use crate::models::AuthResponse;
 use serde::{Deserialize, Deserializer};
 use std::sync::OnceLock;
@@ -375,6 +376,8 @@ pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Resu
 const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 /// S3 requires parts of at least 5 MB (except the last).
 const PART_SIZE: u64 = 16 * 1024 * 1024;
+/// Parts of one file uploading at the same time, so a single large file can use more of the line.
+const PART_PARALLEL: usize = 4;
 const PART_ATTEMPTS: u32 = 4;
 
 /// Client for S3 transfers. No total deadline (see upload_to_s3); a
@@ -512,19 +515,40 @@ async fn send_parts(
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
     let part_count = size.div_ceil(PART_SIZE) as u32;
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| format!("Open file error: {e}"))?;
-    let mut parts = Vec::with_capacity(part_count as usize);
 
+    // Parts go up a few at a time. One at a time meant a single large file was a single
+    // connection, so a 4 GB recording could never use more than a slice of the line however much
+    // of it was free. Reading stays sequential: the parts are read off disk in order and handed to
+    // the uploads as they are read, so memory holds PART_PARALLEL chunks at most.
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| format!("Open file error: {e}"))?;
+    let mut chunks = Vec::with_capacity(part_count as usize);
     for number in 1..=part_count {
         let offset = u64::from(number - 1) * PART_SIZE;
         let len = PART_SIZE.min(size - offset) as usize;
         let mut chunk = vec![0u8; len];
         file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| format!("Seek error: {e}"))?;
         file.read_exact(&mut chunk).await.map_err(|e| format!("Read error at part {number}: {e}"))?;
-
-        let etag = send_part(token, workspace_id, init, number, chunk).await?;
-        parts.push(serde_json::json!({ "PartNumber": number, "ETag": etag }));
+        chunks.push((number, chunk));
     }
+
+    let mut numbered: Vec<(u32, String)> = futures_util::stream::iter(chunks.into_iter().map(
+        |(number, chunk)| async move {
+            let etag = send_part(token, workspace_id, init, number, chunk).await?;
+            Ok::<_, String>((number, etag))
+        },
+    ))
+    .buffer_unordered(PART_PARALLEL)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, String>>()?;
+
+    // S3 wants the parts listed in order, whatever order they finished in.
+    numbered.sort_by_key(|(number, _)| *number);
+    let parts: Vec<serde_json::Value> = numbered
+        .into_iter()
+        .map(|(number, etag)| serde_json::json!({ "PartNumber": number, "ETag": etag }))
+        .collect();
 
     multipart_call(token, workspace_id, &serde_json::json!({
         "action": "complete", "storageKey": init.storage_key, "uploadId": init.upload_id, "parts": parts,

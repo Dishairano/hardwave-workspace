@@ -4,6 +4,7 @@
 //! Workspace API for remote changes. Uses SHA-256 hashes to detect diffs.
 
 use crate::api;
+use futures_util::stream::StreamExt as _;
 use crate::models::{SyncEntry, SyncStatus};
 use notify::{RecursiveMode, Watcher, Event, EventKind};
 use sha2::{Sha256, Digest};
@@ -1037,18 +1038,16 @@ impl SyncEngine {
             // to match. The index lock is only taken for the brief per-batch
             // flush below.
             let mut uploaded_count = 0usize;
-            for batch in to_upload.chunks(16) {
-                let mut tasks = Vec::new();
-                for (full_rel, local_path, size, sha_opt) in batch {
+            // A continuous queue, not batches. Batching waited for the slowest file in each group
+            // of sixteen, so one 4 GB recording left fifteen workers idle; on a line with 5.9
+            // Mbit/s spare that showed up as a fifth of the bandwidth being used.
+            let uploads = futures_util::stream::iter(to_upload.into_iter().map(
+                |(full_rel, local_path, size, sha_opt)| {
                     let token = token.to_string();
                     let ws_id = ws.id.clone();
                     let ws_name = ws.name.clone();
-                    let full_rel = full_rel.clone();
-                    let local_path = local_path.clone();
-                    let size = *size;
-                    let sha_opt = sha_opt.clone();
 
-                    tasks.push(tokio::spawn(async move {
+                    async move {
                         let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
                             .unwrap_or(&full_rel);
                         let filename = local_path.file_name()
@@ -1098,44 +1097,55 @@ impl SyncEngine {
                         }, 2).await?;
                         let (fr, sh, sz, fid, wid) = upload;
                         Ok::<_, String>((fr, sh, sz, fid, wid, entry_mtime))
-                    }));
+                    }
+                },
+            ))
+            .buffer_unordered(UPLOAD_PARALLEL);
+
+            futures_util::pin_mut!(uploads);
+            // Record finished files in small groups: the index is written to disk each time, and
+            // writing it after every single file on a 120k-file workspace costs more than it saves.
+            let mut pending_entries: Vec<SyncEntry> = Vec::new();
+            while let Some(result) = uploads.next().await {
+                match result {
+                    Ok((full_rel, sha, size, file_id, ws_id, entry_mtime)) => {
+                        pending_entries.push(SyncEntry {
+                            rel_path: full_rel,
+                            sha256: sha,
+                            modified: chrono::Utc::now().to_rfc3339(),
+                            size,
+                            remote_id: Some(file_id),
+                            workspace_id: Some(ws_id),
+                            mtime: entry_mtime,
+                            verified: true,
+                        });
+                    }
+                    Err(e) => eprintln!("[Sync] Upload failed: {}", e),
                 }
 
-                let results = futures_util::future::join_all(tasks).await;
-                let mut batch_entries: Vec<SyncEntry> = Vec::new();
-                for result in results {
-                    match result {
-                        Ok(Ok((full_rel, sha, size, file_id, ws_id, entry_mtime))) => {
-                            batch_entries.push(SyncEntry {
-                                rel_path: full_rel,
-                                sha256: sha,
-                                modified: chrono::Utc::now().to_rfc3339(),
-                                size,
-                                remote_id: Some(file_id),
-                                workspace_id: Some(ws_id),
-                                mtime: entry_mtime,
-                                verified: true,
-                            });
-                        }
-                        Ok(Err(e)) => eprintln!("[Sync] Upload failed: {}", e),
-                        Err(e) => eprintln!("[Sync] Upload task panicked: {}", e),
-                    }
-                }
-                // Persist each batch as it lands, not once at the end of the
-                // workspace. On a big workspace this means progress survives a
-                // restart (a batch already on S3 is not re-uploaded) and the
-                // panel advances live instead of only when the workspace ends.
-                if !batch_entries.is_empty() {
-                    uploaded_count += batch_entries.len();
+                if pending_entries.len() >= UPLOAD_FLUSH_EVERY {
+                    uploaded_count += pending_entries.len();
                     {
                         let mut idx = self.index.lock().await;
-                        for e in &batch_entries {
+                        for e in &pending_entries {
                             idx.insert(e.rel_path.clone(), e.clone());
                         }
                         write_index(&idx);
                     }
+                    pending_entries.clear();
                     let _ = self.app.emit("sync:status", self.get_status().await);
                 }
+            }
+            if !pending_entries.is_empty() {
+                uploaded_count += pending_entries.len();
+                {
+                    let mut idx = self.index.lock().await;
+                    for e in &pending_entries {
+                        idx.insert(e.rel_path.clone(), e.clone());
+                    }
+                    write_index(&idx);
+                }
+                let _ = self.app.emit("sync:status", self.get_status().await);
             }
             if uploaded_count > 0 {
                 eprintln!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
@@ -1335,6 +1345,13 @@ async fn reconcile_from_server(
 }
 
 /// How many files Free Up Space hashes and converts at once.
+/// Files uploading at the same time. Sixteen keeps a queue of small files moving without the
+/// per-file API round trips becoming the limit, and with the queue continuous a few large files
+/// no longer block the rest.
+const UPLOAD_PARALLEL: usize = 16;
+/// How many finished files to collect before writing the index to disk.
+const UPLOAD_FLUSH_EVERY: usize = 16;
+
 const FREE_SPACE_PARALLEL: usize = 4;
 
 /// Convert every already-uploaded local file into a dehydrated placeholder.

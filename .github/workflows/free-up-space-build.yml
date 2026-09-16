@@ -6,7 +6,7 @@ name: Free Up Space build
 on:
   workflow_dispatch:
   push:
-    branches: [feat/free-up-space-cli]
+    branches: [feat/free-up-space-cli, feat/upload-throughput]
 
 permissions:
   contents: read
