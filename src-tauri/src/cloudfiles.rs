@@ -35,18 +35,12 @@ mod imp {
     use super::*;
 
     pub fn is_supported() -> bool { false }
-    pub fn with_conversion_policy<T>(
+    pub fn replace_with_placeholder(
         _root: &Path,
-        _provider_name: &str,
-        work: impl FnOnce() -> T,
-    ) -> Result<T, String> {
-        Ok(work())
-    }
-    pub fn register(_root: &Path, _provider_id: &str) -> Result<(), String> {
-        Err("Files On-Demand is Windows only".into())
-    }
-    pub fn unregister(_root: &Path) -> Result<(), String> { Ok(()) }
-    pub fn create_placeholders(_root: &Path, _dir: &str, _files: &[RemoteFile]) -> Result<u32, String> {
+        _rel_path: &str,
+        _size: u64,
+        _identity: &str,
+    ) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn is_placeholder(_path: &Path) -> bool { false }
@@ -84,25 +78,6 @@ mod imp {
 
     /// Claim a directory tree as ours. Safe to call repeatedly: the UPDATE flag
     /// re-registers rather than failing on an existing root.
-    /// Re-register the sync root with the population policy that allows converting ordinary files
-    /// into placeholders, run `work`, then put the normal policy back whatever happens.
-    ///
-    /// Under ALWAYS_FULL the platform treats the namespace as complete and refuses
-    /// CfConvertToPlaceholder with 0x8007017C, which is why Free Up Space could not free a single
-    /// ordinary file: 95,610 refusals against 20 successes, the 20 being files that were already
-    /// placeholders and only needed dehydrating.
-    pub fn with_conversion_policy<T>(
-        root: &Path,
-        provider_name: &str,
-        work: impl FnOnce() -> T,
-    ) -> Result<T, String> {
-        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_FULL.0))?;
-        let out = work();
-        // Put ALWAYS_FULL back even if the work panicked its way out; Explorer crawls without it.
-        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))?;
-        Ok(out)
-    }
-
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
         register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))
     }
@@ -266,6 +241,40 @@ mod imp {
     /// Only safe for files the server already holds — the identity argument is
     /// how we assert that, and it is the same `workspaceId/fileId` handle used
     /// when creating a placeholder from the remote index.
+    /// Turn a file that is fully on disk into a placeholder, freeing its bytes.
+    ///
+    /// Two routes, because the platform allows different ones depending on the file:
+    ///  - already a placeholder: dehydrate it, which is all the tray action ever managed;
+    ///  - an ordinary file: remove it and create a placeholder in its place. Converting in place
+    ///    is refused under this sync root's population policy, measured on the founder's machine
+    ///    as 95,610 refusals with 0x8007017C against 20 successes.
+    ///
+    /// The caller MUST have checked the file's SHA-256 against the server first. This deletes the
+    /// only local copy, and the placeholder is worth nothing if the server copy does not match.
+    pub fn replace_with_placeholder(
+        root: &Path,
+        rel_path: &str,
+        size: u64,
+        identity: &str,
+    ) -> Result<(), String> {
+        let path = root.join(rel_path.replace('/', "\\"));
+        if is_placeholder(&path) {
+            return dehydrate(&path, identity);
+        }
+        let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        let file = RemoteFile {
+            rel_path: rel_path.to_string(),
+            size,
+            identity: identity.to_string(),
+        };
+        match create_placeholders(root, dir, &[file]) {
+            Ok(1) => Ok(()),
+            Ok(n) => Err(format!("created {n} placeholders for one file")),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn dehydrate(path: &Path, identity: &str) -> Result<(), String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Storage::FileSystem::{
@@ -345,6 +354,6 @@ mod imp {
 
 #[allow(unused_imports)]
 pub use imp::{
-    create_placeholders, dehydrate, is_placeholder, is_supported, register, unregister,
-    with_conversion_policy,
+    create_placeholders, dehydrate, is_placeholder, is_supported, register,
+    replace_with_placeholder, unregister,
 };
