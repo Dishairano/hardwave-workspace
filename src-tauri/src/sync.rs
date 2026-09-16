@@ -1170,17 +1170,19 @@ impl SyncEngine {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new());
 
-            let url = format!(
-                "{}/workspaces/{}/events?token={}",
-                api::ws_base(), workspace_id, token
-            );
+            // The token goes in a header, not the query string. reqwest prints the whole URL in
+            // its error messages, so a token in the query ends up in the log file in plain text
+            // on every failed connect, which is where the founder's admin token was found on
+            // 2026-09-16. The route accepts either; the query form exists for browser EventSource,
+            // which cannot set headers. This is not a browser.
+            let url = format!("{}/workspaces/{}/events", api::ws_base(), workspace_id);
 
             let mut backoff_ms = 2_000u64;
             loop {
                 eprintln!("[SSE] Connecting to workspace {}", workspace_id);
-                match sse_client.get(&url).send().await {
+                match sse_client.get(&url).bearer_auth(&token).send().await {
                     Err(e) => {
-                        eprintln!("[SSE] Connect error: {e}");
+                        eprintln!("[SSE] Connect error: {}", redact_token(&e.to_string()));
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         eprintln!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
@@ -1348,6 +1350,26 @@ async fn reconcile_from_server(
 /// Files uploading at the same time. Sixteen keeps a queue of small files moving without the
 /// per-file API round trips becoming the limit, and with the queue continuous a few large files
 /// no longer block the rest.
+/// Strip any `token=...` out of text on its way to a log.
+///
+/// Logs get pasted into bug reports and support mail. A login token in one is a working key to
+/// somebody's account for as long as it lives.
+pub fn redact_token(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("token=") {
+        out.push_str(&rest[..at + "token=".len()]);
+        out.push_str("REDACTED");
+        let after = &rest[at + "token=".len()..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 const UPLOAD_PARALLEL: usize = 16;
 /// How many finished files to collect before writing the index to disk.
 const UPLOAD_FLUSH_EVERY: usize = 16;
@@ -1805,4 +1827,23 @@ fn prune_empty_dirs(dir: &Path) {
         let _ = std::fs::remove_file(f);
     }
     let _ = std::fs::remove_dir(dir);
+}
+
+#[cfg(test)]
+mod redact_token_tests {
+    use super::redact_token;
+
+    #[test]
+    fn takes_the_token_out_of_a_url() {
+        let line = "error sending request for url (https://workspace.hardwavestudios.com/api/workspaces/2/events?token=eyJhbGciOiJIUzI1NiJ9.abc-DEF_123.sig)";
+        let out = redact_token(line);
+        assert!(out.contains("token=REDACTED"));
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(out.ends_with(')'), "the rest of the message survives: {out}");
+    }
+
+    #[test]
+    fn leaves_ordinary_text_alone() {
+        assert_eq!(redact_token("nothing to hide here"), "nothing to hide here");
+    }
 }
