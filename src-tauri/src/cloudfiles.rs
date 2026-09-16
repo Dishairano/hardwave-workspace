@@ -35,6 +35,13 @@ mod imp {
     use super::*;
 
     pub fn is_supported() -> bool { false }
+    pub fn register(_root: &Path, _provider_name: &str) -> Result<(), String> {
+        Err("Files On-Demand is Windows only".into())
+    }
+    pub fn unregister(_root: &Path) -> Result<(), String> { Ok(()) }
+    pub fn create_placeholders(_root: &Path, _dir: &str, _files: &[RemoteFile]) -> Result<u32, String> {
+        Err("Files On-Demand is Windows only".into())
+    }
     pub fn replace_with_placeholder(
         _root: &Path,
         _rel_path: &str,
