@@ -35,11 +35,12 @@ mod imp {
     use super::*;
 
     pub fn is_supported() -> bool { false }
-    pub fn register(_root: &Path, _provider_id: &str) -> Result<(), String> {
-        Err("Files On-Demand is Windows only".into())
-    }
-    pub fn unregister(_root: &Path) -> Result<(), String> { Ok(()) }
-    pub fn create_placeholders(_root: &Path, _dir: &str, _files: &[RemoteFile]) -> Result<u32, String> {
+    pub fn replace_with_placeholder(
+        _root: &Path,
+        _rel_path: &str,
+        _size: u64,
+        _identity: &str,
+    ) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn is_placeholder(_path: &Path) -> bool { false }
@@ -78,6 +79,14 @@ mod imp {
     /// Claim a directory tree as ours. Safe to call repeatedly: the UPDATE flag
     /// re-registers rather than failing on an existing root.
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
+        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))
+    }
+
+    fn register_with(
+        root: &Path,
+        provider_name: &str,
+        population: CF_POPULATION_POLICY_PRIMARY,
+    ) -> Result<(), String> {
         std::fs::create_dir_all(root).map_err(|e| format!("create sync root: {e}"))?;
 
         let root_w = wide(&root.to_string_lossy());
@@ -120,7 +129,7 @@ mod imp {
             // open sat waiting for the timeout. ALWAYS_FULL tells the platform
             // never to forward enumeration at all.
             Population: CF_POPULATION_POLICY {
-                Primary: CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0),
+                Primary: population,
                 Modifier: CF_POPULATION_POLICY_MODIFIER(0),
             },
             InSync: CF_INSYNC_POLICY_TRACK_ALL,
@@ -232,6 +241,40 @@ mod imp {
     /// Only safe for files the server already holds — the identity argument is
     /// how we assert that, and it is the same `workspaceId/fileId` handle used
     /// when creating a placeholder from the remote index.
+    /// Turn a file that is fully on disk into a placeholder, freeing its bytes.
+    ///
+    /// Two routes, because the platform allows different ones depending on the file:
+    ///  - already a placeholder: dehydrate it, which is all the tray action ever managed;
+    ///  - an ordinary file: remove it and create a placeholder in its place. Converting in place
+    ///    is refused under this sync root's population policy, measured on the founder's machine
+    ///    as 95,610 refusals with 0x8007017C against 20 successes.
+    ///
+    /// The caller MUST have checked the file's SHA-256 against the server first. This deletes the
+    /// only local copy, and the placeholder is worth nothing if the server copy does not match.
+    pub fn replace_with_placeholder(
+        root: &Path,
+        rel_path: &str,
+        size: u64,
+        identity: &str,
+    ) -> Result<(), String> {
+        let path = root.join(rel_path.replace('/', "\\"));
+        if is_placeholder(&path) {
+            return dehydrate(&path, identity);
+        }
+        let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        let file = RemoteFile {
+            rel_path: rel_path.to_string(),
+            size,
+            identity: identity.to_string(),
+        };
+        match create_placeholders(root, dir, &[file]) {
+            Ok(1) => Ok(()),
+            Ok(n) => Err(format!("created {n} placeholders for one file")),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn dehydrate(path: &Path, identity: &str) -> Result<(), String> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::Storage::FileSystem::{
@@ -256,20 +299,39 @@ mod imp {
         }
         .map_err(|e| format!("open {}: {e}", path.display()))?;
 
-        // MARK_IN_SYNC asserts the server copy is current, which DEHYDRATE
-        // requires before it will discard the local bytes.
-        let res = unsafe {
-            CfConvertToPlaceholder(
-                handle,
-                Some(ident_w.as_ptr() as *const c_void),
-                (ident_w.len() * 2) as u32,
-                CF_CONVERT_FLAG_MARK_IN_SYNC | CF_CONVERT_FLAG_DEHYDRATE,
-                None,
-                None,
-            )
+        // Two steps, not one. CF_CONVERT_FLAG_DEHYDRATE only applies to a file that is ALREADY a
+        // placeholder; passing it while converting an ordinary file fails the whole call with
+        // 0x8007017C ("the cloud operation is invalid"). That is what Free Up Space was doing on
+        // every ordinary file: on the founder's machine 95,611 files were refused and 20 freed,
+        // the 20 being the ones that happened to be placeholders already.
+        //
+        // So: convert to a placeholder and mark it in sync (the platform will not drop local bytes
+        // it believes are newer than the server's), then dehydrate that placeholder.
+        let already = is_placeholder(path);
+        let converted = if already {
+            Ok(())
+        } else {
+            unsafe {
+                CfConvertToPlaceholder(
+                    handle,
+                    Some(ident_w.as_ptr() as *const c_void),
+                    (ident_w.len() * 2) as u32,
+                    CF_CONVERT_FLAG_MARK_IN_SYNC,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|e| err(e.code(), "CfConvertToPlaceholder"))
         };
+
+        let res = converted.and_then(|()| {
+            // Length -1 means the whole file.
+            unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
+                .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
+        });
+
         unsafe { let _ = CloseHandle(handle); }
-        res.map_err(|e| err(e.code(), "CfConvertToPlaceholder"))
+        res
     }
 
     /// Is this path a placeholder we own, rather than a real file? Used to skip
@@ -291,4 +353,7 @@ mod imp {
 }
 
 #[allow(unused_imports)]
-pub use imp::{create_placeholders, dehydrate, is_placeholder, is_supported, register, unregister};
+pub use imp::{
+    create_placeholders, dehydrate, is_placeholder, is_supported, register,
+    replace_with_placeholder, unregister,
+};

@@ -1,0 +1,61 @@
+name: Free Up Space build
+
+# Manual, and on this branch. Builds the app on a real Windows runner and uploads the bare
+# hardwave-workspace.exe, so `--free-up-space` can be run on a machine over a remote shell
+# without installing anything. It publishes no release.
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/free-up-space-cli]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: freeup-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Build
+        working-directory: src-tauri
+        run: cargo build --release
+
+      - name: Upload the exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardwave-workspace-exe
+          path: src-tauri/target/release/hardwave-workspace.exe
+          if-no-files-found: error
+
+  link:
+    name: hw-link.exe
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: tools/hw-link
+        run: cargo build --release
+
+      - name: Upload the exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hw-link-exe
+          path: tools/hw-link/target/release/hw-link.exe
+          if-no-files-found: error

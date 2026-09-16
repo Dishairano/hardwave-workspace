@@ -61,6 +61,103 @@ fn load_saved_token() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Free Up Space from the command line, without starting the interface.
+///
+/// The tray action hands `free_up_space` the running engine so it can ask the server what it
+/// holds. Here there is no engine, so it works from the sync index on disk, which is exactly
+/// what the tray action falls back to when the server is unreachable. Everything the index
+/// lists as uploaded becomes a placeholder; anything still uploading is left alone.
+///
+/// The result goes to stdout AND to `%TEMP%\\hardwave-freeup.txt`, because the release build is
+/// a windows subsystem binary: started from a shell it has no console to print to.
+pub fn free_up_space_cli() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // Borrow the calling shell's console so the output is visible when run by hand.
+        windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        )
+        .ok();
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            report_free_up(&format!("Could not start: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    // Windows only lets the process that is CONNECTED to the sync root turn files into
+    // placeholders. Without this, every conversion comes back 0x8007017C ("the cloud operation
+    // is invalid") and nothing is freed, which is exactly what the first version of this command
+    // did on the founder's machine: 95,615 files attempted, 0 freed.
+    //
+    // Only one process can hold that connection, so the app must be closed while this runs.
+    // Hydration requests that arrive meanwhile are refused: nothing should be opening these
+    // files with the app shut, and refusing is safer than serving bytes with no token.
+    #[cfg(target_os = "windows")]
+    let _connection = {
+        let root = sync::sync_root();
+        let fetcher: hydration::Fetcher = std::sync::Arc::new(|_identity, _offset, _length| {
+            Box::pin(async { Err("Hardwave Workspace is not running".to_string()) })
+        });
+        match runtime.block_on(async { hydration::connect(&root, fetcher) }) {
+            Ok(c) => c,
+            Err(e) => {
+                report_free_up(&format!(
+                    "Could not take over Files On-Demand ({e}). Close Hardwave Workspace \
+                     (right click the tray icon, Quit) and run this again."
+                ));
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // No policy switching here: re-registering the root with CF_POPULATION_POLICY_FULL is itself
+    // refused with 0x8007017C, so that idea is dead. Run with the root exactly as the app leaves it.
+    let message = match runtime.block_on(sync::free_up_space(None)) {
+        Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or \
+                       the rest are not on the server yet."
+            .to_string(),
+        Ok((files, bytes)) => format!(
+            "Freed {:.2} GB across {} files. They stay in Explorer and download again when opened.",
+            bytes as f64 / 1_073_741_824.0,
+            files
+        ),
+        Err(e) => {
+            report_free_up(&format!("Could not free up space: {e}"));
+            std::process::exit(1);
+        }
+    };
+    report_free_up(&message);
+}
+
+/// Register the Hardwave folder as a cloud sync root again, and say what happened.
+pub fn register_sync_root_cli() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows::Win32::System::Console::AttachConsole(
+            windows::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        )
+        .ok();
+    }
+    let root = sync::sync_root();
+    match cloudfiles::register(&root, "Hardwave Workspace") {
+        Ok(()) => report_free_up(&format!("Registered {} as a cloud folder again.", root.display())),
+        Err(e) => {
+            report_free_up(&format!("Could not register {}: {e}", root.display()));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn report_free_up(message: &str) {
+    println!("{message}");
+    let path = std::env::temp_dir().join("hardwave-freeup.txt");
+    let _ = std::fs::write(&path, format!("{message}\n"));
+}
+
 // ─── Tauri Commands ────────────────────────────────────────────────────────
 
 #[tauri::command]

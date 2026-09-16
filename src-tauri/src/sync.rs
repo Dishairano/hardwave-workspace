@@ -1240,6 +1240,7 @@ struct FreeCandidate {
     expected_sha: String,
     /// Hash before discarding. False only for an entry that is verified AND
     /// unchanged since (same size and mtime as recorded).
+    #[allow(dead_code)] // every candidate is hashed now; the flag stays for the callers that set it.
     needs_hash: bool,
     /// Index entry to record once freed, for a server match the index did not
     /// have yet. None for files already in the index.
@@ -1430,23 +1431,29 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
     // Hash (when needed) and convert, a few files at a time, off the async
     // threads. A hash that does not match leaves the file fully on disk.
     let results: Vec<(FreeCandidate, Result<bool, String>)> = stream::iter(candidates)
-        .map(|c| async move {
+        .map(|c| {
+            let root = root.clone();
+            async move {
             let path = c.path.clone();
             let expected = c.expected_sha.clone();
             let identity = c.identity.clone();
-            let needs_hash = c.needs_hash;
+            let rel_path = c.rel_path.clone();
+            let size = c.size;
             let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-                if needs_hash {
-                    match hash_file(&path) {
-                        Ok(h) if h == expected => {}
-                        _ => return Ok(false),
-                    }
+                // Always hash, never trust the index alone. Freeing an ordinary file deletes the
+                // only local copy before the placeholder takes its place, so the server copy has
+                // to be proven identical first, not merely recorded as uploaded.
+                match hash_file(&path) {
+                    Ok(h) if h == expected => {}
+                    _ => return Ok(false),
                 }
-                crate::cloudfiles::dehydrate(&path, &identity).map(|()| true)
+                crate::cloudfiles::replace_with_placeholder(&root, &rel_path, size, &identity)
+                    .map(|()| true)
             })
             .await
             .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
             (c, outcome)
+            }
         })
         .buffer_unordered(FREE_SPACE_PARALLEL)
         .collect()
