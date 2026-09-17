@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tauri::{Emitter, Manager};
 
@@ -297,6 +297,8 @@ pub struct SyncEngine {
     /// Cached (computed_at, files_on_disk, bytes_on_disk) so get_status can
     /// report the honest total without re-walking 120k files on every call.
     disk_cache: RwLock<Option<(std::time::Instant, u32, u64)>>,
+    /// How many uploads to run at once right now (see UPLOAD_PARALLEL).
+    upload_parallel: AtomicUsize,
 }
 
 impl SyncEngine {
@@ -320,6 +322,7 @@ impl SyncEngine {
             app,
             paused: Arc::new(RwLock::new(false)),
             sync_active: AtomicBool::new(false),
+            upload_parallel: AtomicUsize::new(UPLOAD_PARALLEL),
             sse_handles: Mutex::new(Vec::new()),
             sse_trigger: Arc::new(tokio::sync::Notify::new()),
             disk_cache: RwLock::new(None),
@@ -1100,15 +1103,19 @@ impl SyncEngine {
                     }
                 },
             ))
-            .buffer_unordered(UPLOAD_PARALLEL);
+            .buffer_unordered(self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN));
 
             futures_util::pin_mut!(uploads);
+            // Outcomes of this pass, so the width can follow the line (see below).
+            let mut pass_ok = 0usize;
+            let mut pass_failed = 0usize;
             // Record finished files in small groups: the index is written to disk each time, and
             // writing it after every single file on a 120k-file workspace costs more than it saves.
             let mut pending_entries: Vec<SyncEntry> = Vec::new();
             while let Some(result) = uploads.next().await {
                 match result {
                     Ok((full_rel, sha, size, file_id, ws_id, entry_mtime)) => {
+                        pass_ok += 1;
                         pending_entries.push(SyncEntry {
                             rel_path: full_rel,
                             sha256: sha,
@@ -1120,7 +1127,10 @@ impl SyncEngine {
                             verified: true,
                         });
                     }
-                    Err(e) => eprintln!("[Sync] Upload failed: {}", e),
+                    Err(e) => {
+                        pass_failed += 1;
+                        eprintln!("[Sync] Upload failed: {}", e);
+                    }
                 }
 
                 if pending_entries.len() >= UPLOAD_FLUSH_EVERY {
@@ -1149,6 +1159,29 @@ impl SyncEngine {
             }
             if uploaded_count > 0 {
                 eprintln!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
+            }
+
+            // Follow the line. Most uploads failing means the path to storage is
+            // refusing work, and sixteen hung transfers at once only make that
+            // worse, so halve the queue; a clean pass widens it again. Both ends
+            // are clamped, and a pass that tried nothing changes nothing.
+            let tried = pass_ok + pass_failed;
+            if tried > 0 {
+                let width = self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN);
+                let next = if pass_failed * 2 > tried {
+                    (width / 2).max(UPLOAD_PARALLEL_MIN)
+                } else if pass_failed * 10 <= tried {
+                    (width + 2).min(UPLOAD_PARALLEL)
+                } else {
+                    width
+                };
+                if next != width {
+                    eprintln!(
+                        "[Sync] {}/{} uploads failed in '{}': {} at a time -> {}",
+                        pass_failed, tried, ws.name, width, next
+                    );
+                    self.upload_parallel.store(next, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1370,7 +1403,13 @@ pub fn redact_token(text: &str) -> String {
     out
 }
 
+/// Files uploading at the same time when the line is behaving. A pass that
+/// fails most of its uploads halves this, down to one, and a clean pass grows
+/// it back: on 2026-09-17 every one of 240 uploads hung for the full 120 s
+/// client timeout, sixteen at a time, and a narrower queue is the only thing
+/// the client can do about a path that stops answering.
 const UPLOAD_PARALLEL: usize = 16;
+const UPLOAD_PARALLEL_MIN: usize = 1;
 /// How many finished files to collect before writing the index to disk.
 const UPLOAD_FLUSH_EVERY: usize = 16;
 

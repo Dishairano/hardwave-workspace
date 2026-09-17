@@ -372,22 +372,26 @@ pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Resu
 // ---------------------------------------------------------------------------
 
 /// Files above this go up in parts, so a dropped connection costs one part
-/// instead of the whole file.
-const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+/// instead of the whole file. Lowered from 64 MB on 2026-09-17: a backlog of
+/// 60 MB stems stalled for hours, and every stall threw away the whole file.
+const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// S3 requires parts of at least 5 MB (except the last).
-const PART_SIZE: u64 = 16 * 1024 * 1024;
+const PART_SIZE: u64 = 8 * 1024 * 1024;
 /// Parts of one file uploading at the same time, so a single large file can use more of the line.
 const PART_PARALLEL: usize = 4;
 const PART_ATTEMPTS: u32 = 4;
 
 /// Client for S3 transfers. No total deadline (see upload_to_s3); a
-/// connection that stops delivering a response still errors after 120 s.
+/// connection that stops delivering a response still errors after 60 s. That
+/// was 120 s until 2026-09-17, when a path to storage that accepted
+/// connections and then answered nothing cost two minutes per file, sixteen
+/// files at a time, for hours.
 fn upload_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(120))
+            .read_timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(10)
             .build()
             .expect("Failed to create upload HTTP client")
