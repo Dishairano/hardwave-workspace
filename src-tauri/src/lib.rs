@@ -408,8 +408,21 @@ fn load_auto_sync_pref() -> bool {
 // Periodically read hw_session cookie from webview and pass to sync engine.
 
 async fn start_token_bridge(handle: tauri::AppHandle) {
+    // Five seconds until the session is known, then every five minutes. The
+    // token is a JWT that outlives any five-second window, and the old fixed
+    // 5 s loop meant one idle app asked the server for it 17,000 times a day.
+    // A logged-out app goes back to the short interval, because that is when
+    // an answer actually changes something.
+    use std::time::Duration;
+    const FAST: Duration = Duration::from_secs(5);
+    const SLOW: Duration = Duration::from_secs(300);
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let have_token = {
+            let state = handle.state::<AppState>();
+            let token = state.api_token.lock().await;
+            token.is_some()
+        };
+        tokio::time::sleep(if have_token { SLOW } else { FAST }).await;
         if let Some(win) = handle.get_webview_window("main") {
             // The hw_session cookie is httpOnly so JS can't read document.cookie.
             // Instead, fetch the /api/auth/sync-token endpoint which returns the JWT.
