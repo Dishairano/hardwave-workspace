@@ -506,7 +506,19 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }))
-        .plugin(tauri_plugin_log::Builder::new().build())
+        // Info and above, and none of reqwest's per-connection chatter. The log
+        // file was 38 KB of "starting new connection" covering four minutes,
+        // which is worse than useless: the sync engine's own failures were the
+        // one thing it did not record.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .level_for("reqwest", log::LevelFilter::Warn)
+                .level_for("hyper", log::LevelFilter::Warn)
+                .level_for("hyper_util", log::LevelFilter::Warn)
+                .level_for("rustls", log::LevelFilter::Warn)
+                .build(),
+        )
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

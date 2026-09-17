@@ -1686,6 +1686,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures-util",
  "hex",
+ "log",
  "notify",
  "reqwest 0.12.28",
  "serde",

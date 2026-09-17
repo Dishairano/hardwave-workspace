@@ -952,7 +952,7 @@ impl SyncEngine {
                         self.emit_file_progress(rel_path, "download", 100);
                     }
                     Err(e) => {
-                        eprintln!("[Sync] Download failed for '{}': {}", rel_path, e);
+                        log::warn!("[Sync] Download failed for '{}': {}", rel_path, e);
                     }
                 }
             }
@@ -1405,10 +1405,14 @@ pub fn redact_token(text: &str) -> String {
 
 /// Files uploading at the same time when the line is behaving. A pass that
 /// fails most of its uploads halves this, down to one, and a clean pass grows
-/// it back: on 2026-09-17 every one of 240 uploads hung for the full 120 s
-/// client timeout, sixteen at a time, and a narrower queue is the only thing
-/// the client can do about a path that stops answering.
-const UPLOAD_PARALLEL: usize = 16;
+/// it back.
+///
+/// Sixteen was too many. A home line carries one upload rate no matter how it
+/// is divided, and on 2026-09-17 sixteen shares of 2.7 MB/s meant no single
+/// 60 MB stem could finish before its own timeout: 240 files, six hours, zero
+/// uploaded. Eight files of two parts each is sixteen connections at most,
+/// which is enough to keep the line full without starving any one transfer.
+const UPLOAD_PARALLEL: usize = 8;
 const UPLOAD_PARALLEL_MIN: usize = 1;
 /// How many finished files to collect before writing the index to disk.
 const UPLOAD_FLUSH_EVERY: usize = 16;

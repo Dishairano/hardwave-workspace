@@ -378,20 +378,28 @@ const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
 /// S3 requires parts of at least 5 MB (except the last).
 const PART_SIZE: u64 = 8 * 1024 * 1024;
 /// Parts of one file uploading at the same time, so a single large file can use more of the line.
-const PART_PARALLEL: usize = 4;
+/// Multiplied by the sync engine's file width, so keep it small: the line is
+/// shared, and splitting it too many ways is what made every transfer too slow
+/// to finish in the first place.
+const PART_PARALLEL: usize = 2;
 const PART_ATTEMPTS: u32 = 4;
 
-/// Client for S3 transfers. No total deadline (see upload_to_s3); a
-/// connection that stops delivering a response still errors after 60 s. That
-/// was 120 s until 2026-09-17, when a path to storage that accepted
-/// connections and then answered nothing cost two minutes per file, sixteen
-/// files at a time, for hours.
+/// Client for S3 transfers. No total deadline (see upload_to_s3).
+///
+/// `read_timeout` is NOT a stall detector here: storage says nothing at all
+/// until the whole body has arrived, so this is really "how long one upload
+/// may take". On 2026-09-17 that was 120 s against sixteen parallel 60 MB
+/// stems on a 2.7 MB/s line, where one upload needs about six minutes of
+/// sending. Every single one was killed at two minutes, retried, and killed
+/// again, for six hours, while the small files before them had always
+/// finished inside the window. Parts (8 MB) are what keep a transfer short
+/// now; the window is wide enough that a slow line is never the reason.
 fn upload_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(60))
+            .read_timeout(Duration::from_secs(600))
             .pool_max_idle_per_host(10)
             .build()
             .expect("Failed to create upload HTTP client")
