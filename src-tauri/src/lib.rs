@@ -1,15 +1,15 @@
+mod api;
 mod cloudfiles;
 mod hydration;
-mod api;
 mod models;
 mod sync;
 
 use models::SyncStatus;
 use std::sync::Arc;
 use tauri::{
-    Manager, State, WebviewWindow,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
+    Manager, State, WebviewWindow,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -22,8 +22,13 @@ pub struct AppState {
 /// Safely call a frontend function with serializable data.
 /// Embeds JSON directly as a JS expression (valid JSON is valid JS).
 pub fn safe_eval<T: serde::Serialize>(win: &WebviewWindow, fn_name: &str, data: &T) {
-    let Ok(json) = serde_json::to_string(data) else { return };
-    let fn_safe: String = fn_name.chars().filter(|c| *c != '\'' && *c != '\\').collect();
+    let Ok(json) = serde_json::to_string(data) else {
+        return;
+    };
+    let fn_safe: String = fn_name
+        .chars()
+        .filter(|c| *c != '\'' && *c != '\\')
+        .collect();
     let js = format!(
         "try{{window['{}'] && window['{}']({})}}catch(e){{}}",
         fn_safe, fn_safe, json
@@ -80,7 +85,10 @@ pub fn free_up_space_cli() {
         .ok();
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             report_free_up(&format!("Could not start: {e}"));
@@ -144,7 +152,10 @@ pub fn register_sync_root_cli() {
     }
     let root = sync::sync_root();
     match cloudfiles::register(&root, "Hardwave Workspace") {
-        Ok(()) => report_free_up(&format!("Registered {} as a cloud folder again.", root.display())),
+        Ok(()) => report_free_up(&format!(
+            "Registered {} as a cloud folder again.",
+            root.display()
+        )),
         Err(e) => {
             report_free_up(&format!("Could not register {}: {e}", root.display()));
             std::process::exit(1);
@@ -287,23 +298,36 @@ async fn download_file(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let token = state.api_token.lock().await.clone()
+    let token = state
+        .api_token
+        .lock()
+        .await
+        .clone()
         .ok_or("Not logged in")?;
 
     let url = api::get_download_url(&token, &workspace_id, &file_id).await?;
 
-    let downloads = dirs::download_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("Downloads"));
+    let downloads = dirs::download_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("Downloads")
+    });
     let _ = std::fs::create_dir_all(&downloads);
     let save_path = downloads.join(&filename);
 
-    let res = api::http_client().get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    let res = api::http_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
     if !res.status().is_success() {
         return Err(format!("Download error: {}", res.status()));
     }
     let total = res.content_length().unwrap_or(0);
     let mut stream = res.bytes_stream();
-    let mut file = tokio::fs::File::create(&save_path).await.map_err(|e| format!("Create file error: {}", e))?;
+    let mut file = tokio::fs::File::create(&save_path)
+        .await
+        .map_err(|e| format!("Create file error: {}", e))?;
     let mut downloaded: u64 = 0;
     let mut last_pct: u64 = 0;
 
@@ -312,22 +336,30 @@ async fn download_file(
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("Download stream error: {}", e))?;
-        file.write_all(&chunk).await.map_err(|e| format!("Write error: {}", e))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Write error: {}", e))?;
         downloaded += chunk.len() as u64;
         let pct = (downloaded * 100).checked_div(total).unwrap_or(0);
         if pct != last_pct {
             last_pct = pct;
             if let Some(win) = app.get_webview_window("main") {
-                safe_eval(&win, "__HW_DOWNLOAD_PROGRESS__", &serde_json::json!({
-                    "pct": pct,
-                    "downloaded": downloaded,
-                    "total": total,
-                    "filename": filename,
-                }));
+                safe_eval(
+                    &win,
+                    "__HW_DOWNLOAD_PROGRESS__",
+                    &serde_json::json!({
+                        "pct": pct,
+                        "downloaded": downloaded,
+                        "total": total,
+                        "filename": filename,
+                    }),
+                );
             }
         }
     }
-    file.flush().await.map_err(|e| format!("Flush error: {}", e))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Flush error: {}", e))?;
 
     Ok(save_path.to_string_lossy().to_string())
 }
@@ -362,15 +394,23 @@ async fn archive_pick_folder(app: tauri::AppHandle) -> Result<Option<String>, St
     // has to pump the dialog, so the picker never appeared at all. A oneshot we
     // await yields instead of blocking.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |p| { let _ = tx.send(p); });
+    app.dialog().file().pick_folder(move |p| {
+        let _ = tx.send(p);
+    });
     let picked = rx.await.map_err(|e| e.to_string())?;
-    Ok(picked.and_then(|p| p.into_path().ok()).map(|p| p.to_string_lossy().to_string()))
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string()))
 }
 
 /// Workspaces the signed-in user can move files into.
 #[tauri::command]
 async fn archive_workspaces(state: State<'_, AppState>) -> Result<Vec<api::Workspace>, String> {
-    let token = state.api_token.lock().await.clone()
+    let token = state
+        .api_token
+        .lock()
+        .await
+        .clone()
         .ok_or_else(|| "Not signed in".to_string())?;
     api::list_workspaces(&token).await
 }
@@ -384,9 +424,19 @@ async fn archive_start(
     workspace_id: Option<String>,
     dest_folder: Option<String>,
 ) -> Result<sync::ArchiveReport, String> {
-    let engine = state.sync_engine.lock().await.clone()
+    let engine = state
+        .sync_engine
+        .lock()
+        .await
+        .clone()
         .ok_or_else(|| "Sign in first".to_string())?;
-    sync::archive_folder(engine, std::path::PathBuf::from(path), workspace_id, dest_folder).await
+    sync::archive_folder(
+        engine,
+        std::path::PathBuf::from(path),
+        workspace_id,
+        dest_folder,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -472,11 +522,15 @@ async fn check_for_updates(handle: tauri::AppHandle) {
     };
 
     if let Some(win) = handle.get_webview_window("main") {
-        safe_eval(&win, "__HW_UPDATE__", &serde_json::json!({
-            "version": update.version,
-            "body": update.body.unwrap_or_default(),
-            "currentVersion": env!("CARGO_PKG_VERSION"),
-        }));
+        safe_eval(
+            &win,
+            "__HW_UPDATE__",
+            &serde_json::json!({
+                "version": update.version,
+                "body": update.body.unwrap_or_default(),
+                "currentVersion": env!("CARGO_PKG_VERSION"),
+            }),
+        );
     }
 }
 
@@ -486,19 +540,27 @@ async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
 
     let updater = handle.updater().map_err(|e| e.to_string())?;
-    let update = updater.check().await.map_err(|e| e.to_string())?
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
         .ok_or("No update available")?;
 
     let h = handle.clone();
-    update.download_and_install(
-        move |downloaded, total| {
-            let pct = total.map(|t| (downloaded as f64 / t as f64 * 100.0) as u32).unwrap_or(0);
-            if let Some(win) = h.get_webview_window("main") {
-                let _ = win.eval(format!("window.__HW_UPDATE_PROGRESS__ = {};", pct));
-            }
-        },
-        || {},
-    ).await.map_err(|e| format!("Install failed: {}", e))?;
+    update
+        .download_and_install(
+            move |downloaded, total| {
+                let pct = total
+                    .map(|t| (downloaded as f64 / t as f64 * 100.0) as u32)
+                    .unwrap_or(0);
+                if let Some(win) = h.get_webview_window("main") {
+                    let _ = win.eval(format!("window.__HW_UPDATE_PROGRESS__ = {};", pct));
+                }
+            },
+            || {},
+        )
+        .await
+        .map_err(|e| format!("Install failed: {}", e))?;
 
     handle.restart();
 }

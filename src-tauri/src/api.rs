@@ -1,5 +1,5 @@
-use futures_util::stream::StreamExt as _;
 use crate::models::AuthResponse;
+use futures_util::stream::StreamExt as _;
 use serde::{Deserialize, Deserializer};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -41,7 +41,9 @@ const WS_BASE: &str = match option_env!("HW_WS_API_BASE") {
 };
 
 /// Expose WS_BASE for SSE URL construction in other modules.
-pub fn ws_base() -> &'static str { WS_BASE }
+pub fn ws_base() -> &'static str {
+    WS_BASE
+}
 
 /// Retry a fallible async operation up to `max_retries` times with exponential backoff.
 pub async fn with_retry<T>(
@@ -58,11 +60,17 @@ pub async fn with_retry<T>(
             Ok(val) => return Ok(val),
             Err(e) => {
                 last_err = e;
-                eprintln!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
+                eprintln!(
+                    "[API] Retry {}/{} failed: {}",
+                    attempt, max_retries, last_err
+                );
             }
         }
     }
-    Err(format!("Failed after {} retries: {}", max_retries, last_err))
+    Err(format!(
+        "Failed after {} retries: {}",
+        max_retries, last_err
+    ))
 }
 
 pub async fn login(email: &str, password: &str) -> Result<AuthResponse, String> {
@@ -74,8 +82,7 @@ pub async fn login(email: &str, password: &str) -> Result<AuthResponse, String> 
         .map_err(|e| format!("Login failed: {}", e))?;
 
     let body = res.text().await.map_err(|e| e.to_string())?;
-    serde_json::from_str::<AuthResponse>(&body)
-        .map_err(|e| format!("Parse error: {}", e))
+    serde_json::from_str::<AuthResponse>(&body).map_err(|e| format!("Parse error: {}", e))
 }
 
 pub async fn logout(token: &str) -> Result<(), String> {
@@ -151,7 +158,10 @@ pub async fn list_workspaces(token: &str) -> Result<Vec<Workspace>, String> {
 /// List all files in a workspace.
 pub async fn list_files(token: &str, workspace_id: &str) -> Result<Vec<WorkspaceFile>, String> {
     let res = http_client()
-        .get(format!("{}/workspaces/{}/files?all=true", WS_BASE, workspace_id))
+        .get(format!(
+            "{}/workspaces/{}/files?all=true",
+            WS_BASE, workspace_id
+        ))
         .bearer_auth(token)
         .send()
         .await
@@ -210,9 +220,16 @@ pub async fn list_folders(token: &str, workspace_id: &str) -> Result<Vec<Workspa
 }
 
 /// Get a presigned download URL for a file.
-pub async fn get_download_url(token: &str, workspace_id: &str, file_id: &str) -> Result<String, String> {
+pub async fn get_download_url(
+    token: &str,
+    workspace_id: &str,
+    file_id: &str,
+) -> Result<String, String> {
     let res = http_client()
-        .get(format!("{}/workspaces/{}/files/{}", WS_BASE, workspace_id, file_id))
+        .get(format!(
+            "{}/workspaces/{}/files/{}",
+            WS_BASE, workspace_id, file_id
+        ))
         .bearer_auth(token)
         .send()
         .await
@@ -275,7 +292,11 @@ impl UploadInitResponse {
             serde_json::Value::String(v) => v,
             other => return Err(format!("unexpected fileId: {other}")),
         };
-        Ok(Self { upload_url, file_id, already_uploaded })
+        Ok(Self {
+            upload_url,
+            file_id,
+            already_uploaded,
+        })
     }
 }
 
@@ -312,10 +333,15 @@ pub async fn init_upload(
     // Read the text first: reqwest's .json() hides the serde detail behind
     // "error decoding response body", which says nothing about which field
     // was wrong.
-    let body = res.text().await.map_err(|e| format!("Upload init read failed: {e}"))?;
+    let body = res
+        .text()
+        .await
+        .map_err(|e| format!("Upload init read failed: {e}"))?;
     let raw = serde_json::from_str::<RawUploadInit>(&body).map_err(|e| {
-        format!("Upload init returned an unexpected reply ({e}): {}",
-                body.chars().take(200).collect::<String>())
+        format!(
+            "Upload init returned an unexpected reply ({e}): {}",
+            body.chars().take(200).collect::<String>()
+        )
     })?;
     UploadInitResponse::from_raw(raw)
 }
@@ -323,7 +349,10 @@ pub async fn init_upload(
 /// Confirm upload completion.
 pub async fn register_upload(token: &str, workspace_id: &str, file_id: &str) -> Result<(), String> {
     let res = http_client()
-        .post(format!("{}/workspaces/{}/files/register", WS_BASE, workspace_id))
+        .post(format!(
+            "{}/workspaces/{}/files/register",
+            WS_BASE, workspace_id
+        ))
         .bearer_auth(token)
         .json(&serde_json::json!({ "file_id": file_id }))
         .send()
@@ -339,7 +368,9 @@ pub async fn register_upload(token: &str, workspace_id: &str, file_id: &str) -> 
 
 /// Upload a file to a presigned S3 URL by streaming from disk.
 pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Result<(), String> {
-    let file = tokio::fs::File::open(file_path).await.map_err(|e| format!("Open file error: {}", e))?;
+    let file = tokio::fs::File::open(file_path)
+        .await
+        .map_err(|e| format!("Open file error: {}", e))?;
     let file_size = file.metadata().await.map_err(|e| e.to_string())?.len();
     let stream = tokio_util::io::ReaderStream::new(file);
     let body = reqwest::Body::wrap_stream(stream);
@@ -365,7 +396,6 @@ pub async fn upload_to_s3(upload_url: &str, file_path: &std::path::Path) -> Resu
     }
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Uploads
@@ -435,7 +465,16 @@ pub async fn upload_file(
         register_upload(token, workspace_id, &u.file_id).await?;
         return Ok(u.file_id);
     }
-    upload_multipart(token, workspace_id, filename, size, folder_path, sha256, path).await
+    upload_multipart(
+        token,
+        workspace_id,
+        filename,
+        size,
+        folder_path,
+        sha256,
+        path,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -455,19 +494,32 @@ struct PartUrls {
     urls: Vec<String>,
 }
 
-async fn multipart_call(token: &str, workspace_id: &str, body: &serde_json::Value) -> Result<String, String> {
+async fn multipart_call(
+    token: &str,
+    workspace_id: &str,
+    body: &serde_json::Value,
+) -> Result<String, String> {
     let action = body["action"].as_str().unwrap_or("multipart");
     let res = http_client()
-        .post(format!("{}/workspaces/{}/files/multipart", WS_BASE, workspace_id))
+        .post(format!(
+            "{}/workspaces/{}/files/multipart",
+            WS_BASE, workspace_id
+        ))
         .bearer_auth(token)
         .json(body)
         .send()
         .await
         .map_err(|e| format!("Multipart {action} failed: {e}"))?;
     let status = res.status();
-    let text = res.text().await.map_err(|e| format!("Multipart {action} read failed: {e}"))?;
+    let text = res
+        .text()
+        .await
+        .map_err(|e| format!("Multipart {action} read failed: {e}"))?;
     if !status.is_success() {
-        return Err(format!("Multipart {action} error {status}: {}", text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "Multipart {action} error {status}: {}",
+            text.chars().take(200).collect::<String>()
+        ));
     }
     Ok(text)
 }
@@ -493,15 +545,23 @@ async fn upload_multipart(
     }
     let text = multipart_call(token, workspace_id, &body).await?;
     let init: MultipartInit = serde_json::from_str(&text).map_err(|e| {
-        format!("Multipart initiate returned an unexpected reply ({e}): {}", text.chars().take(200).collect::<String>())
+        format!(
+            "Multipart initiate returned an unexpected reply ({e}): {}",
+            text.chars().take(200).collect::<String>()
+        )
     })?;
 
     if init.already_uploaded {
         // Identical bytes are already stored. The server still opens a multipart
         // upload for older clients, so close it rather than leave it pending.
-        let _ = multipart_call(token, workspace_id, &serde_json::json!({
-            "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
-        })).await;
+        let _ = multipart_call(
+            token,
+            workspace_id,
+            &serde_json::json!({
+                "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
+            }),
+        )
+        .await;
         return Ok(init.file_id);
     }
 
@@ -509,9 +569,14 @@ async fn upload_multipart(
     if let Err(e) = result {
         // Free the parts already stored and drop the pending row; the caller's
         // retry starts a clean upload.
-        let _ = multipart_call(token, workspace_id, &serde_json::json!({
-            "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
-        })).await;
+        let _ = multipart_call(
+            token,
+            workspace_id,
+            &serde_json::json!({
+                "action": "abort", "storageKey": init.storage_key, "uploadId": init.upload_id,
+            }),
+        )
+        .await;
         return Err(e);
     }
     Ok(init.file_id)
@@ -532,28 +597,33 @@ async fn send_parts(
     // connection, so a 4 GB recording could never use more than a slice of the line however much
     // of it was free. Reading stays sequential: the parts are read off disk in order and handed to
     // the uploads as they are read, so memory holds PART_PARALLEL chunks at most.
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| format!("Open file error: {e}"))?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("Open file error: {e}"))?;
     let mut chunks = Vec::with_capacity(part_count as usize);
     for number in 1..=part_count {
         let offset = u64::from(number - 1) * PART_SIZE;
         let len = PART_SIZE.min(size - offset) as usize;
         let mut chunk = vec![0u8; len];
-        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| format!("Seek error: {e}"))?;
-        file.read_exact(&mut chunk).await.map_err(|e| format!("Read error at part {number}: {e}"))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| format!("Seek error: {e}"))?;
+        file.read_exact(&mut chunk)
+            .await
+            .map_err(|e| format!("Read error at part {number}: {e}"))?;
         chunks.push((number, chunk));
     }
 
-    let mut numbered: Vec<(u32, String)> = futures_util::stream::iter(chunks.into_iter().map(
-        |(number, chunk)| async move {
+    let mut numbered: Vec<(u32, String)> =
+        futures_util::stream::iter(chunks.into_iter().map(|(number, chunk)| async move {
             let etag = send_part(token, workspace_id, init, number, chunk).await?;
             Ok::<_, String>((number, etag))
-        },
-    ))
-    .buffer_unordered(PART_PARALLEL)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, String>>()?;
+        }))
+        .buffer_unordered(PART_PARALLEL)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, String>>()?;
 
     // S3 wants the parts listed in order, whatever order they finished in.
     numbered.sort_by_key(|(number, _)| *number);
@@ -589,9 +659,15 @@ async fn send_part(
             Ok(t) => t,
             Err(e) => { last_err = e; continue; }
         };
-        let url = match serde_json::from_str::<PartUrls>(&text).ok().and_then(|u| u.urls.into_iter().next()) {
+        let url = match serde_json::from_str::<PartUrls>(&text)
+            .ok()
+            .and_then(|u| u.urls.into_iter().next())
+        {
             Some(u) => u,
-            None => { last_err = format!("no URL for part {number}"); continue; }
+            None => {
+                last_err = format!("no URL for part {number}");
+                continue;
+            }
         };
 
         let deadline = upload_deadline(chunk.len() as u64);
@@ -615,7 +691,11 @@ async fn send_part(
             Ok(Err(e)) => last_err = format!("part {number}: {e}"),
             Err(_) => last_err = format!("part {number}: timed out after {} s", deadline.as_secs()),
         }
-        eprintln!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
+        eprintln!(
+            "[API] Part {number} attempt {}/{} failed: {last_err}",
+            attempt + 1,
+            PART_ATTEMPTS
+        );
     }
     Err(format!("Upload failed at part {number}: {last_err}"))
 }
