@@ -34,20 +34,12 @@ pub struct RemoteFile {
 mod imp {
     use super::*;
 
-    pub fn is_supported() -> bool {
-        false
-    }
+    pub fn is_supported() -> bool { false }
     pub fn register(_root: &Path, _provider_name: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
-    pub fn unregister(_root: &Path) -> Result<(), String> {
-        Ok(())
-    }
-    pub fn create_placeholders(
-        _root: &Path,
-        _dir: &str,
-        _files: &[RemoteFile],
-    ) -> Result<u32, String> {
+    pub fn unregister(_root: &Path) -> Result<(), String> { Ok(()) }
+    pub fn create_placeholders(_root: &Path, _dir: &str, _files: &[RemoteFile]) -> Result<u32, String> {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn replace_with_placeholder(
@@ -58,9 +50,7 @@ mod imp {
     ) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
-    pub fn is_placeholder(_path: &Path) -> bool {
-        false
-    }
+    pub fn is_placeholder(_path: &Path) -> bool { false }
     pub fn dehydrate(_path: &Path, _identity: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
@@ -96,11 +86,7 @@ mod imp {
     /// Claim a directory tree as ours. Safe to call repeatedly: the UPDATE flag
     /// re-registers rather than failing on an existing root.
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
-        register_with(
-            root,
-            provider_name,
-            CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0),
-        )
+        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))
     }
 
     fn register_with(
@@ -190,11 +176,7 @@ mod imp {
             return Ok(0);
         }
 
-        let target: PathBuf = if dir.is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(dir)
-        };
+        let target: PathBuf = if dir.is_empty() { root.to_path_buf() } else { root.join(dir) };
         std::fs::create_dir_all(&target).map_err(|e| format!("create dir: {e}"))?;
         let target_w = wide(&target.to_string_lossy());
 
@@ -355,9 +337,7 @@ mod imp {
                 .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
         });
 
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
+        unsafe { let _ = CloseHandle(handle); }
         res
     }
 

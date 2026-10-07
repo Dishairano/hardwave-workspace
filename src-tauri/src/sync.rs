@@ -4,17 +4,17 @@
 //! Workspace API for remote changes. Uses SHA-256 hashes to detect diffs.
 
 use crate::api;
-use crate::models::{SyncEntry, SyncStatus};
 use futures_util::stream::StreamExt as _;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
-use sha2::{Digest, Sha256};
+use crate::models::{SyncEntry, SyncStatus};
+use notify::{RecursiveMode, Watcher, Event, EventKind};
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tauri::{Emitter, Manager};
 
 /// How often to poll the remote for changes (seconds).
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -61,12 +61,8 @@ fn hash_file(path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("Read error: {}", e))?;
-        if n == 0 {
-            break;
-        }
+        let n = reader.read(&mut buf).map_err(|e| format!("Read error: {}", e))?;
+        if n == 0 { break; }
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -124,9 +120,7 @@ pub(crate) fn trust_without_hash(
 /// Server timestamps arrive as ISO 8601 in UTC. Anything else is treated as
 /// unknown, which makes `trust_without_hash` refuse rather than guess.
 fn parse_server_time(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|t| t.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp())
 }
 
 #[cfg(test)]
@@ -141,65 +135,29 @@ mod trust_without_hash_tests {
 
     #[test]
     fn unchanged_since_upload_is_trusted() {
-        assert!(trust_without_hash(
-            10,
-            Some(created() - 60),
-            10,
-            Some("ab"),
-            Some(CREATED)
-        ));
+        assert!(trust_without_hash(10, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
     }
 
     #[test]
     fn edited_after_upload_is_not_trusted_even_at_the_same_size() {
-        assert!(!trust_without_hash(
-            10,
-            Some(created() + 60),
-            10,
-            Some("ab"),
-            Some(CREATED)
-        ));
+        assert!(!trust_without_hash(10, Some(created() + 60), 10, Some("ab"), Some(CREATED)));
     }
 
     #[test]
     fn different_size_is_not_trusted() {
-        assert!(!trust_without_hash(
-            11,
-            Some(created() - 60),
-            10,
-            Some("ab"),
-            Some(CREATED)
-        ));
+        assert!(!trust_without_hash(11, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
     }
 
     #[test]
     fn no_server_checksum_is_not_trusted() {
-        assert!(!trust_without_hash(
-            10,
-            Some(created() - 60),
-            10,
-            None,
-            Some(CREATED)
-        ));
-        assert!(!trust_without_hash(
-            10,
-            Some(created() - 60),
-            10,
-            Some(""),
-            Some(CREATED)
-        ));
+        assert!(!trust_without_hash(10, Some(created() - 60), 10, None, Some(CREATED)));
+        assert!(!trust_without_hash(10, Some(created() - 60), 10, Some(""), Some(CREATED)));
     }
 
     #[test]
     fn unknown_times_are_not_trusted() {
         assert!(!trust_without_hash(10, None, 10, Some("ab"), Some(CREATED)));
-        assert!(!trust_without_hash(
-            10,
-            Some(0),
-            10,
-            Some("ab"),
-            Some("2026-09-01 10:00:00")
-        ));
+        assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), Some("2026-09-01 10:00:00")));
         assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), None));
     }
 }
@@ -256,52 +214,31 @@ mod upload_plan_tests {
     use super::*;
     #[test]
     fn untracked_uploads() {
-        assert_eq!(
-            plan_upload(None, None, false, 10, Some(5)),
-            UploadPlan::UploadNew
-        );
+        assert_eq!(plan_upload(None, None, false, 10, Some(5)), UploadPlan::UploadNew);
     }
     #[test]
     fn size_change_uploads() {
-        assert_eq!(
-            plan_upload(Some(9), Some(5), true, 10, Some(5)),
-            UploadPlan::UploadNew
-        );
+        assert_eq!(plan_upload(Some(9), Some(5), true, 10, Some(5)), UploadPlan::UploadNew);
     }
     #[test]
     fn indexed_but_not_uploaded_uploads() {
-        assert_eq!(
-            plan_upload(Some(10), None, false, 10, Some(5)),
-            UploadPlan::UploadNew
-        );
+        assert_eq!(plan_upload(Some(10), None, false, 10, Some(5)), UploadPlan::UploadNew);
     }
     #[test]
     fn same_size_and_mtime_skips() {
-        assert_eq!(
-            plan_upload(Some(10), Some(5), true, 10, Some(5)),
-            UploadPlan::Skip
-        );
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(5)), UploadPlan::Skip);
     }
     #[test]
     fn uploaded_no_stored_mtime_trusts() {
-        assert_eq!(
-            plan_upload(Some(10), None, true, 10, Some(5)),
-            UploadPlan::TrustBackfill
-        );
+        assert_eq!(plan_upload(Some(10), None, true, 10, Some(5)), UploadPlan::TrustBackfill);
     }
     #[test]
     fn same_size_diff_mtime_verifies() {
-        assert_eq!(
-            plan_upload(Some(10), Some(5), true, 10, Some(6)),
-            UploadPlan::VerifyByHash
-        );
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(6)), UploadPlan::VerifyByHash);
     }
     #[test]
     fn same_size_unknown_current_mtime_verifies() {
-        assert_eq!(
-            plan_upload(Some(10), Some(5), true, 10, None),
-            UploadPlan::VerifyByHash
-        );
+        assert_eq!(plan_upload(Some(10), Some(5), true, 10, None), UploadPlan::VerifyByHash);
     }
 }
 
@@ -329,8 +266,7 @@ fn scan_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u
         }
 
         // Skip hidden files and .hardwave-sync metadata
-        if path
-            .file_name()
+        if path.file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.starts_with('.'))
             .unwrap_or(false)
@@ -397,9 +333,7 @@ impl SyncEngine {
         // Abort any existing SSE connections (token changed or logged out)
         {
             let mut handles = self.sse_handles.lock().await;
-            for h in handles.drain(..) {
-                h.abort();
-            }
+            for h in handles.drain(..) { h.abort(); }
         }
 
         let is_new = token.is_some();
@@ -420,8 +354,9 @@ impl SyncEngine {
                         eprintln!("[Sync] Created workspace folder: {}", ws_dir.display());
                         if let Ok(folders) = api::list_folders(&t, &ws.id).await {
                             for f in &folders {
-                                let folder_path =
-                                    f.path.as_deref().unwrap_or(&f.name).trim_matches('/');
+                                let folder_path = f.path.as_deref()
+                                    .unwrap_or(&f.name)
+                                    .trim_matches('/');
                                 if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                                     let dir = ws_dir.join(folder_path);
                                     let _ = std::fs::create_dir_all(&dir);
@@ -511,36 +446,25 @@ impl SyncEngine {
     /// Push per-file sync progress to the webview via safe eval.
     fn emit_file_progress(&self, rel_path: &str, direction: &str, percent: u32) {
         if let Some(win) = self.app.get_webview_window("main") {
-            crate::safe_eval(
-                &win,
-                "__HW_SYNC_FILE__",
-                &serde_json::json!({
-                    "rel_path": rel_path,
-                    "direction": direction,
-                    "percent": percent,
-                }),
-            );
+            crate::safe_eval(&win, "__HW_SYNC_FILE__", &serde_json::json!({
+                "rel_path": rel_path,
+                "direction": direction,
+                "percent": percent,
+            }));
         }
     }
 
     /// Emit a conflict warning to the webview.
     fn emit_conflict(&self, rel_path: &str, local_size: u64, remote_size: u64) {
         if let Some(win) = self.app.get_webview_window("main") {
-            crate::safe_eval(
-                &win,
-                "__HW_SYNC_CONFLICTS__",
-                &serde_json::json!({
-                    "rel_path": rel_path,
-                    "local_size": local_size,
-                    "remote_size": remote_size,
-                    "time": chrono::Utc::now().timestamp_millis(),
-                }),
-            );
+            crate::safe_eval(&win, "__HW_SYNC_CONFLICTS__", &serde_json::json!({
+                "rel_path": rel_path,
+                "local_size": local_size,
+                "remote_size": remote_size,
+                "time": chrono::Utc::now().timestamp_millis(),
+            }));
         }
-        eprintln!(
-            "[Sync] CONFLICT: '{}' exists locally ({} bytes) but differs from remote ({} bytes)",
-            rel_path, local_size, remote_size
-        );
+        eprintln!("[Sync] CONFLICT: '{}' exists locally ({} bytes) but differs from remote ({} bytes)", rel_path, local_size, remote_size);
     }
 
     /// Start the sync loop. Call this once on app startup.
@@ -556,57 +480,48 @@ impl SyncEngine {
             match crate::cloudfiles::register(&root, "Hardwave Workspace") {
                 Ok(()) => {
                     let token = Arc::clone(&self.token);
-                    let fetcher: crate::hydration::Fetcher =
-                        std::sync::Arc::new(move |identity: String, offset: u64, length: u64| {
-                            let token = Arc::clone(&token);
-                            Box::pin(async move {
-                                // identity is "workspaceId/fileId", set when the
-                                // placeholder was created.
-                                let (ws_id, file_id) = identity
-                                    .split_once('/')
-                                    .ok_or_else(|| format!("bad file identity: {identity}"))?;
-                                let tok = token
-                                    .read()
-                                    .await
-                                    .clone()
-                                    .ok_or_else(|| "not signed in".to_string())?;
-                                let url = api::get_download_url(&tok, ws_id, file_id).await?;
+                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64| {
+                        let token = Arc::clone(&token);
+                        Box::pin(async move {
+                            // identity is "workspaceId/fileId", set when the
+                            // placeholder was created.
+                            let (ws_id, file_id) = identity
+                                .split_once('/')
+                                .ok_or_else(|| format!("bad file identity: {identity}"))?;
+                            let tok = token.read().await.clone()
+                                .ok_or_else(|| "not signed in".to_string())?;
+                            let url = api::get_download_url(&tok, ws_id, file_id).await?;
 
-                                // Ask object storage for just the slice Windows
-                                // wants, so opening one sample does not pull a
-                                // whole pack. Not every backend honours Range, so
-                                // fall back to a whole-object GET rather than
-                                // failing the hydration.
-                                let end = offset + length.saturating_sub(1);
-                                let ranged = api::http_client()
-                                    .get(&url)
-                                    .header("Range", format!("bytes={}-{}", offset, end))
-                                    .send()
-                                    .await
-                                    .map_err(|e| format!("hydrate request failed: {e}"))?;
+                            // Ask object storage for just the slice Windows
+                            // wants, so opening one sample does not pull a
+                            // whole pack. Not every backend honours Range, so
+                            // fall back to a whole-object GET rather than
+                            // failing the hydration.
+                            let end = offset + length.saturating_sub(1);
+                            let ranged = api::http_client()
+                                .get(&url)
+                                .header("Range", format!("bytes={}-{}", offset, end))
+                                .send().await
+                                .map_err(|e| format!("hydrate request failed: {e}"))?;
 
-                                let status = ranged.status();
-                                if status.as_u16() == 206 {
-                                    let b = ranged
-                                        .bytes()
-                                        .await
-                                        .map_err(|e| format!("hydrate body failed: {e}"))?;
-                                    return Ok(b.to_vec());
-                                }
-                                if !status.is_success() {
-                                    return Err(format!("hydrate HTTP {status}"));
-                                }
-                                // 200 means the whole object came back; take the
-                                // window Windows actually asked for.
-                                let all = ranged
-                                    .bytes()
-                                    .await
+                            let status = ranged.status();
+                            if status.as_u16() == 206 {
+                                let b = ranged.bytes().await
                                     .map_err(|e| format!("hydrate body failed: {e}"))?;
-                                let start = (offset as usize).min(all.len());
-                                let stop = (start + length as usize).min(all.len());
-                                Ok(all[start..stop].to_vec())
-                            })
-                        });
+                                return Ok(b.to_vec());
+                            }
+                            if !status.is_success() {
+                                return Err(format!("hydrate HTTP {status}"));
+                            }
+                            // 200 means the whole object came back; take the
+                            // window Windows actually asked for.
+                            let all = ranged.bytes().await
+                                .map_err(|e| format!("hydrate body failed: {e}"))?;
+                            let start = (offset as usize).min(all.len());
+                            let stop = (start + length as usize).min(all.len());
+                            Ok(all[start..stop].to_vec())
+                        })
+                    });
 
                     match crate::hydration::connect(&root, fetcher) {
                         Ok(conn) => {
@@ -619,14 +534,10 @@ impl SyncEngine {
                                 std::sync::OnceLock::new();
                             let _ = HYDRATION.set(conn);
                         }
-                        Err(e) => eprintln!(
-                            "[Sync] hydration connect failed: {e} — falling back to full downloads"
-                        ),
+                        Err(e) => eprintln!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
                     }
                 }
-                Err(e) => eprintln!(
-                    "[Sync] sync-root registration failed: {e} — falling back to full downloads"
-                ),
+                Err(e) => eprintln!("[Sync] sync-root registration failed: {e} — falling back to full downloads"),
             }
         }
 
@@ -659,11 +570,7 @@ impl SyncEngine {
                 }
             };
             if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                eprintln!(
-                    "[Sync] Failed to start watching '{}': {}",
-                    root.display(),
-                    e
-                );
+                eprintln!("[Sync] Failed to start watching '{}': {}", root.display(), e);
                 return;
             }
             // Keep the watcher alive
@@ -753,12 +660,10 @@ impl SyncEngine {
             None => return Ok(()),
         };
 
-        let filename = full_path
-            .file_name()
+        let filename = full_path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        let folder = Path::new(file_path_in_ws)
-            .parent()
+        let folder = Path::new(file_path_in_ws).parent()
             .and_then(|p| p.to_str())
             .filter(|s| !s.is_empty());
 
@@ -767,58 +672,42 @@ impl SyncEngine {
 
         // Upload with retry (no index lock held)
         let file_size = meta.len();
-        let upload = api::with_retry(
-            {
+        let upload = api::with_retry({
+            let token = token.clone();
+            let ws_id = ws_id.clone();
+            let filename = filename.to_string();
+            let folder = folder.map(|s| s.to_string());
+            let sha = sha.clone();
+            let full_path = full_path.clone();
+            move || {
                 let token = token.clone();
                 let ws_id = ws_id.clone();
-                let filename = filename.to_string();
-                let folder = folder.map(|s| s.to_string());
+                let filename = filename.clone();
+                let folder = folder.clone();
                 let sha = sha.clone();
                 let full_path = full_path.clone();
-                move || {
-                    let token = token.clone();
-                    let ws_id = ws_id.clone();
-                    let filename = filename.clone();
-                    let folder = folder.clone();
-                    let sha = sha.clone();
-                    let full_path = full_path.clone();
-                    Box::pin(async move {
-                        let file_id = api::upload_file(
-                            &token,
-                            &ws_id,
-                            &filename,
-                            file_size,
-                            folder.as_deref(),
-                            &sha,
-                            &full_path,
-                        )
-                        .await?;
-                        Ok::<_, String>((file_id, ws_id))
-                    })
-                }
-            },
-            2,
-        )
-        .await?;
+                Box::pin(async move {
+                    let file_id = api::upload_file(&token, &ws_id, &filename, file_size, folder.as_deref(), &sha, &full_path).await?;
+                    Ok::<_, String>((file_id, ws_id))
+                })
+            }
+        }, 2).await?;
 
         self.emit_file_progress(rel_path, "upload", 100);
 
         // Update index (brief lock)
         {
             let mut index = self.index.lock().await;
-            index.insert(
-                rel_path.to_string(),
-                SyncEntry {
-                    rel_path: rel_path.to_string(),
-                    sha256: sha,
-                    modified: chrono::Utc::now().to_rfc3339(),
-                    size: meta.len(),
-                    remote_id: Some(upload.0),
-                    workspace_id: Some(upload.1),
-                    mtime: file_mtime(&full_path),
-                    verified: true,
-                },
-            );
+            index.insert(rel_path.to_string(), SyncEntry {
+                rel_path: rel_path.to_string(),
+                sha256: sha,
+                modified: chrono::Utc::now().to_rfc3339(),
+                size: meta.len(),
+                remote_id: Some(upload.0),
+                workspace_id: Some(upload.1),
+                mtime: file_mtime(&full_path),
+                verified: true,
+            });
             write_index(&index);
         }
 
@@ -875,7 +764,9 @@ impl SyncEngine {
 
             if let Ok(folders) = api::list_folders(token, &ws.id).await {
                 for f in &folders {
-                    let folder_path = f.path.as_deref().unwrap_or(&f.name).trim_matches('/');
+                    let folder_path = f.path.as_deref()
+                        .unwrap_or(&f.name)
+                        .trim_matches('/');
                     if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                         let _ = std::fs::create_dir_all(ws_dir.join(folder_path));
                     }
@@ -897,22 +788,19 @@ impl SyncEngine {
             // Determine what needs downloading (index lock held briefly)
             let to_download: Vec<(String, api::WorkspaceFile)> = {
                 let idx = self.index.lock().await;
-                remote_files
-                    .iter()
-                    .filter_map(|rf| {
-                        let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
-                        let rel_path = if folder.is_empty() {
-                            format!("{}/{}", ws.name, rf.name)
-                        } else {
-                            format!("{}/{}/{}", ws.name, folder, rf.name)
-                        };
-                        let should = match idx.get(&rel_path) {
-                            Some(e) => rf.sha256.as_deref() != Some(&e.sha256),
-                            None => true,
-                        };
-                        should.then(|| (rel_path, rf.clone()))
-                    })
-                    .collect()
+                remote_files.iter().filter_map(|rf| {
+                    let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
+                    let rel_path = if folder.is_empty() {
+                        format!("{}/{}", ws.name, rf.name)
+                    } else {
+                        format!("{}/{}/{}", ws.name, folder, rf.name)
+                    };
+                    let should = match idx.get(&rel_path) {
+                        Some(e) => rf.sha256.as_deref() != Some(&e.sha256),
+                        None => true,
+                    };
+                    should.then(|| (rel_path, rf.clone()))
+                }).collect()
             };
 
             // Process downloads without holding the index lock.
@@ -1013,52 +901,41 @@ impl SyncEngine {
                             continue;
                         }
                         Ok(_) => eprintln!("[Sync] Placeholder skipped for '{}'", rel_path),
-                        Err(e) => eprintln!(
-                            "[Sync] Placeholder failed for '{}': {} — downloading instead",
-                            rel_path, e
-                        ),
+                        Err(e) => eprintln!("[Sync] Placeholder failed for '{}': {} — downloading instead", rel_path, e),
                     }
                 }
 
                 eprintln!("[Sync] Downloading: {}", rel_path);
                 self.emit_file_progress(rel_path, "download", 0);
                 // Download with retry
-                let dl = api::with_retry(
-                    {
-                        let token = token.to_string();
-                        let ws_id = ws.id.clone();
-                        let rf_id = rf.id.clone();
+                let dl = api::with_retry({
+                    let token = token.to_string();
+                    let ws_id = ws.id.clone();
+                    let rf_id = rf.id.clone();
+                    let rel_path = rel_path.clone();
+                    move || {
+                        let token = token.clone();
+                        let ws_id = ws_id.clone();
+                        let rf_id = rf_id.clone();
                         let rel_path = rel_path.clone();
-                        move || {
-                            let token = token.clone();
-                            let ws_id = ws_id.clone();
-                            let rf_id = rf_id.clone();
-                            let rel_path = rel_path.clone();
-                            Box::pin(async move {
-                                let url = api::get_download_url(&token, &ws_id, &rf_id).await?;
-                                let bytes = api::http_client()
-                                    .get(&url)
-                                    .send()
-                                    .await
-                                    .map_err(|e| format!("Download failed: {}", e))?
-                                    .bytes()
-                                    .await
-                                    .map_err(|e| format!("Read body failed: {}", e))?;
-                                let sha = {
-                                    let mut h = Sha256::new();
-                                    h.update(&bytes);
-                                    hex::encode(h.finalize())
-                                };
-                                let local_path = sync_root().join(&rel_path);
-                                std::fs::write(&local_path, &bytes)
-                                    .map_err(|e| format!("Write failed: {}", e))?;
-                                Ok((sha, bytes.len() as u64))
-                            })
-                        }
-                    },
-                    2,
-                )
-                .await;
+                        Box::pin(async move {
+                            let url = api::get_download_url(&token, &ws_id, &rf_id).await?;
+                            let bytes = api::http_client().get(&url).send().await
+                                .map_err(|e| format!("Download failed: {}", e))?
+                                .bytes().await
+                                .map_err(|e| format!("Read body failed: {}", e))?;
+                            let sha = {
+                                let mut h = Sha256::new();
+                                h.update(&bytes);
+                                hex::encode(h.finalize())
+                            };
+                            let local_path = sync_root().join(&rel_path);
+                            std::fs::write(&local_path, &bytes)
+                                .map_err(|e| format!("Write failed: {}", e))?;
+                            Ok((sha, bytes.len() as u64))
+                        })
+                    }
+                }, 2).await;
 
                 match dl {
                     Ok((sha, size)) => {
@@ -1100,12 +977,7 @@ impl SyncEngine {
             let idx_snapshot: HashMap<String, (u64, String, Option<i64>, bool)> = {
                 let idx = self.index.lock().await;
                 idx.iter()
-                    .map(|(k, e)| {
-                        (
-                            k.clone(),
-                            (e.size, e.sha256.clone(), e.mtime, e.remote_id.is_some()),
-                        )
-                    })
+                    .map(|(k, e)| (k.clone(), (e.size, e.sha256.clone(), e.mtime, e.remote_id.is_some())))
                     .collect()
             };
 
@@ -1121,13 +993,7 @@ impl SyncEngine {
                 let indexed = idx_snapshot.get(&full_rel);
                 let mtime = file_mtime(local_path);
                 let uploaded = indexed.map(|e| e.3).unwrap_or(false);
-                match plan_upload(
-                    indexed.map(|e| e.0),
-                    indexed.and_then(|e| e.2),
-                    uploaded,
-                    *size,
-                    mtime,
-                ) {
+                match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), uploaded, *size, mtime) {
                     UploadPlan::Skip => {}
                     // Already uploaded, just never tagged: record its mtime, no
                     // hash, no re-upload (and no placeholder hydration).
@@ -1185,16 +1051,13 @@ impl SyncEngine {
                     let ws_name = ws.name.clone();
 
                     async move {
-                        let rel_in_ws = full_rel
-                            .strip_prefix(&format!("{}/", ws_name))
+                        let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
                             .unwrap_or(&full_rel);
-                        let filename = local_path
-                            .file_name()
+                        let filename = local_path.file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown")
                             .to_string();
-                        let folder = Path::new(rel_in_ws)
-                            .parent()
+                        let folder = Path::new(rel_in_ws).parent()
                             .and_then(|p| p.to_str())
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
@@ -1214,56 +1077,33 @@ impl SyncEngine {
                             }
                         };
 
-                        let upload = api::with_retry(
-                            {
+                        let upload = api::with_retry({
+                            let token = token.clone();
+                            let ws_id = ws_id.clone();
+                            let filename = filename.clone();
+                            let folder = folder.clone();
+                            let sha = sha.clone();
+                            let local_path = local_path.clone();
+                            move || {
                                 let token = token.clone();
                                 let ws_id = ws_id.clone();
                                 let filename = filename.clone();
                                 let folder = folder.clone();
                                 let sha = sha.clone();
                                 let local_path = local_path.clone();
-                                move || {
-                                    let token = token.clone();
-                                    let ws_id = ws_id.clone();
-                                    let filename = filename.clone();
-                                    let folder = folder.clone();
-                                    let sha = sha.clone();
-                                    let local_path = local_path.clone();
-                                    let full_rel = full_rel.clone();
-                                    Box::pin(async move {
-                                        let file_id = api::upload_file(
-                                            &token,
-                                            &ws_id,
-                                            &filename,
-                                            size,
-                                            folder.as_deref(),
-                                            &sha,
-                                            &local_path,
-                                        )
-                                        .await?;
-                                        Ok::<_, String>((
-                                            full_rel.clone(),
-                                            sha.clone(),
-                                            size,
-                                            file_id,
-                                            ws_id.clone(),
-                                        ))
-                                    })
-                                }
-                            },
-                            2,
-                        )
-                        .await?;
+                                let full_rel = full_rel.clone();
+                                Box::pin(async move {
+                                    let file_id = api::upload_file(&token, &ws_id, &filename, size, folder.as_deref(), &sha, &local_path).await?;
+                                    Ok::<_, String>((full_rel.clone(), sha.clone(), size, file_id, ws_id.clone()))
+                                })
+                            }
+                        }, 2).await?;
                         let (fr, sh, sz, fid, wid) = upload;
                         Ok::<_, String>((fr, sh, sz, fid, wid, entry_mtime))
                     }
                 },
             ))
-            .buffer_unordered(
-                self.upload_parallel
-                    .load(Ordering::Relaxed)
-                    .max(UPLOAD_PARALLEL_MIN),
-            );
+            .buffer_unordered(self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN));
 
             futures_util::pin_mut!(uploads);
             // Outcomes of this pass, so the width can follow the line (see below).
@@ -1318,10 +1158,7 @@ impl SyncEngine {
                 let _ = self.app.emit("sync:status", self.get_status().await);
             }
             if uploaded_count > 0 {
-                eprintln!(
-                    "[Sync] Uploaded {} file(s) in '{}'",
-                    uploaded_count, ws.name
-                );
+                eprintln!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
             }
 
             // Follow the line. Most uploads failing means the path to storage is
@@ -1330,10 +1167,7 @@ impl SyncEngine {
             // are clamped, and a pass that tried nothing changes nothing.
             let tried = pass_ok + pass_failed;
             if tried > 0 {
-                let width = self
-                    .upload_parallel
-                    .load(Ordering::Relaxed)
-                    .max(UPLOAD_PARALLEL_MIN);
+                let width = self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN);
                 let next = if pass_failed * 2 > tried {
                     (width / 2).max(UPLOAD_PARALLEL_MIN)
                 } else if pass_failed * 10 <= tried {
@@ -1384,11 +1218,7 @@ impl SyncEngine {
                         eprintln!("[SSE] Connect error: {}", redact_token(&e.to_string()));
                     }
                     Ok(resp) if !resp.status().is_success() => {
-                        eprintln!(
-                            "[SSE] Auth error {}: stopping SSE for workspace {}",
-                            resp.status(),
-                            workspace_id
-                        );
+                        eprintln!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
                         return; // 401/403 — don't retry, token is gone
                     }
                     Ok(resp) => {
@@ -1404,13 +1234,9 @@ impl SyncEngine {
                                 buf = buf[pos + 2..].to_string();
                                 for line in msg.lines() {
                                     if let Some(data) = line.strip_prefix("data: ") {
-                                        if let Ok(ev) =
-                                            serde_json::from_str::<serde_json::Value>(data)
-                                        {
+                                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) {
                                             let kind = ev["type"].as_str().unwrap_or("");
-                                            if kind == "ping" {
-                                                continue;
-                                            }
+                                            if kind == "ping" { continue; }
                                             eprintln!("[SSE] Event: {}", kind);
                                             // Trigger immediate sync if not already running
                                             if !*paused_arc.read().await
@@ -1421,10 +1247,7 @@ impl SyncEngine {
                                                     crate::safe_eval(&win, "__HW_SSE_EVENT__", &ev);
                                                 }
                                                 // Small delay to batch rapid successive events
-                                                tokio::time::sleep(
-                                                    std::time::Duration::from_millis(300),
-                                                )
-                                                .await;
+                                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                                 // Wake the poll loop for an immediate sync
                                                 sse_trigger.notify_one();
                                                 sync_flag.store(false, Ordering::SeqCst);
@@ -1462,8 +1285,7 @@ struct FreeCandidate {
     expected_sha: String,
     /// Hash before discarding. False only for an entry that is verified AND
     /// unchanged since (same size and mtime as recorded).
-    #[allow(dead_code)]
-    // every candidate is hashed now; the flag stays for the callers that set it.
+    #[allow(dead_code)] // every candidate is hashed now; the flag stays for the callers that set it.
     needs_hash: bool,
     /// Index entry to record once freed, for a server match the index did not
     /// have yet. None for files already in the index.
@@ -1485,12 +1307,7 @@ async fn reconcile_from_server(
     root: &Path,
     index: &HashMap<String, SyncEntry>,
 ) -> Result<(Vec<SyncEntry>, Vec<FreeCandidate>), String> {
-    let token = engine
-        .token
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| "not signed in".to_string())?;
+    let token = engine.token.read().await.clone().ok_or_else(|| "not signed in".to_string())?;
     let workspaces = crate::api::list_workspaces(&token).await?;
     let mut trusted = Vec::new();
     let mut to_hash = Vec::new();
@@ -1513,10 +1330,7 @@ async fn reconcile_from_server(
             };
 
             // Already known and usable.
-            if index
-                .get(&rel_path)
-                .is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some())
-            {
+            if index.get(&rel_path).is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some()) {
                 continue;
             }
 
@@ -1538,10 +1352,7 @@ async fn reconcile_from_server(
             let entry = SyncEntry {
                 rel_path: rel_path.clone(),
                 sha256: remote_sha.to_string(),
-                modified: rf
-                    .updated_at
-                    .clone()
-                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                modified: rf.updated_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 size,
                 remote_id: Some(rf.id.clone()),
                 workspace_id: Some(ws.id.clone()),
@@ -1549,13 +1360,7 @@ async fn reconcile_from_server(
                 verified: false,
             };
 
-            if trust_without_hash(
-                size,
-                mtime,
-                rf.size,
-                Some(remote_sha),
-                rf.created_at.as_deref(),
-            ) {
+            if trust_without_hash(size, mtime, rf.size, Some(remote_sha), rf.created_at.as_deref()) {
                 trusted.push(entry);
             } else {
                 to_hash.push(FreeCandidate {
@@ -1566,10 +1371,7 @@ async fn reconcile_from_server(
                     expected_sha: remote_sha.to_string(),
                     needs_hash: true,
                     // Recorded only after the hash proves it, and then as verified.
-                    new_entry: Some(SyncEntry {
-                        verified: true,
-                        ..entry
-                    }),
+                    new_entry: Some(SyncEntry { verified: true, ..entry }),
                 });
             }
         }
@@ -1668,9 +1470,7 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
                 candidates.extend(to_hash);
             }
             // Only ever adds candidates; the index alone is still usable.
-            Err(e) => eprintln!(
-                "[FreeSpace] could not reach the server ({e}); using the local index only"
-            ),
+            Err(e) => eprintln!("[FreeSpace] could not reach the server ({e}); using the local index only"),
         }
     }
 
@@ -1716,25 +1516,25 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
         .map(|c| {
             let root = root.clone();
             async move {
-                let path = c.path.clone();
-                let expected = c.expected_sha.clone();
-                let identity = c.identity.clone();
-                let rel_path = c.rel_path.clone();
-                let size = c.size;
-                let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-                    // Always hash, never trust the index alone. Freeing an ordinary file deletes the
-                    // only local copy before the placeholder takes its place, so the server copy has
-                    // to be proven identical first, not merely recorded as uploaded.
-                    match hash_file(&path) {
-                        Ok(h) if h == expected => {}
-                        _ => return Ok(false),
-                    }
-                    crate::cloudfiles::replace_with_placeholder(&root, &rel_path, size, &identity)
-                        .map(|()| true)
-                })
-                .await
-                .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
-                (c, outcome)
+            let path = c.path.clone();
+            let expected = c.expected_sha.clone();
+            let identity = c.identity.clone();
+            let rel_path = c.rel_path.clone();
+            let size = c.size;
+            let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                // Always hash, never trust the index alone. Freeing an ordinary file deletes the
+                // only local copy before the placeholder takes its place, so the server copy has
+                // to be proven identical first, not merely recorded as uploaded.
+                match hash_file(&path) {
+                    Ok(h) if h == expected => {}
+                    _ => return Ok(false),
+                }
+                crate::cloudfiles::replace_with_placeholder(&root, &rel_path, size, &identity)
+                    .map(|()| true)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
+            (c, outcome)
             }
         })
         .buffer_unordered(FREE_SPACE_PARALLEL)
@@ -1850,11 +1650,7 @@ pub async fn archive_folder(
 
     // Where the files land inside that workspace. Defaults to a folder named
     // after the one being moved.
-    let base = match dest_folder
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
+    let base = match dest_folder.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         Some(d) => d.trim_matches('/').to_string(),
         None => src
             .file_name()
@@ -1881,11 +1677,7 @@ pub async fn archive_folder(
     // Four matches the existing sync path and keeps memory predictable.
     const PARALLEL: usize = 4;
 
-    let total_bytes: u64 = files
-        .iter()
-        .filter_map(|p| p.metadata().ok())
-        .map(|m| m.len())
-        .sum();
+    let total_bytes: u64 = files.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
     let started = std::time::Instant::now();
     let done_files = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1912,17 +1704,12 @@ pub async fn archive_folder(
                 .and_then(|p| p.strip_prefix(&src).ok())
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            let folder_path = if rel_dir.is_empty() {
-                base.clone()
-            } else {
-                format!("{base}/{rel_dir}")
-            };
+            let folder_path = if rel_dir.is_empty() { base.clone() } else { format!("{base}/{rel_dir}") };
 
             let outcome = async {
                 let sha = hash_file(&path).map_err(|e| format!("unreadable ({e})"))?;
                 // Only Ok once the server has marked the file ready.
-                api::upload_file(&token, &ws_id, &name, size, Some(&folder_path), &sha, &path)
-                    .await?;
+                api::upload_file(&token, &ws_id, &name, size, Some(&folder_path), &sha, &path).await?;
                 Ok::<(), String>(())
             }
             .await;
@@ -1930,11 +1717,7 @@ pub async fn archive_folder(
             let entry = match outcome {
                 Ok(()) => match std::fs::remove_file(&path) {
                     Ok(()) => (true, size, None),
-                    Err(e) => (
-                        false,
-                        0,
-                        Some(format!("{name}: uploaded but not deleted ({e})")),
-                    ),
+                    Err(e) => (false, 0, Some(format!("{name}: uploaded but not deleted ({e})"))),
                 },
                 Err(e) => (false, 0, Some(format!("{name}: {e}"))),
             };
@@ -1975,18 +1758,12 @@ pub async fn archive_folder(
             report.moved += 1;
             report.bytes_freed += bytes;
         } else {
-            if err
-                .as_deref()
-                .map(|e| e.contains("uploaded but not deleted"))
-                .unwrap_or(false)
-            {
+            if err.as_deref().map(|e| e.contains("uploaded but not deleted")).unwrap_or(false) {
                 // Safely stored, just not removed locally. Not a skip.
             } else {
                 report.skipped += 1;
             }
-            if let Some(e) = err {
-                report.errors.push(e.clone());
-            }
+            if let Some(e) = err { report.errors.push(e.clone()); }
         }
     }
     report.seconds = started.elapsed().as_secs();
@@ -2031,9 +1808,7 @@ fn is_hidden(path: &Path) -> bool {
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -2066,9 +1841,7 @@ fn is_folder_metadata(name: &str) -> bool {
 /// metadata is cleared when it is all that remains; a directory still holding
 /// anything real is left exactly as it is.
 fn prune_empty_dirs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut metadata_files = Vec::new();
     let mut has_real_content = false;
 
@@ -2081,10 +1854,7 @@ fn prune_empty_dirs(dir: &Path) {
                 has_real_content = true;
             }
         } else {
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if is_folder_metadata(&name) {
                 metadata_files.push(p);
             } else {
@@ -2112,10 +1882,7 @@ mod redact_token_tests {
         let out = redact_token(line);
         assert!(out.contains("token=REDACTED"));
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
-        assert!(
-            out.ends_with(')'),
-            "the rest of the message survives: {out}"
-        );
+        assert!(out.ends_with(')'), "the rest of the message survives: {out}");
     }
 
     #[test]
