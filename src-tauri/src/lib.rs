@@ -1,4 +1,7 @@
 mod cloudfiles;
+mod conflicts;
+mod pins;
+mod rules;
 mod device;
 mod hydration;
 mod api;
@@ -10,7 +13,7 @@ use std::sync::Arc;
 use tauri::{
     Manager, State, WebviewWindow,
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -117,7 +120,7 @@ pub fn free_up_space_cli() {
 
     // No policy switching here: re-registering the root with CF_POPULATION_POLICY_FULL is itself
     // refused with 0x8007017C, so that idea is dead. Run with the root exactly as the app leaves it.
-    let message = match runtime.block_on(sync::free_up_space(None)) {
+    let message = match runtime.block_on(sync::free_up_space(None, None)) {
         Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or \
                        the rest are not on the server yet."
             .to_string(),
@@ -211,6 +214,267 @@ async fn set_token(token: String, state: State<'_, AppState>) -> Result<(), Stri
         engine.set_token(Some(token)).await;
     }
     Ok(())
+}
+
+/// Files changed on this PC and in Workspace before they synced (conflicts.rs).
+#[tauri::command]
+async fn get_conflicts(state: State<'_, AppState>) -> Result<Vec<conflicts::Conflict>, String> {
+    match state.sync_engine.lock().await.as_ref() {
+        Some(engine) => Ok(engine.list_conflicts().await),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Settle one conflict: keep_local, keep_remote or keep_both. Answers with a
+/// sentence for the window to show.
+#[tauri::command]
+async fn resolve_conflict(rel_path: String, choice: conflicts::Choice, state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    engine.resolve_conflict(&rel_path, choice).await
+}
+
+/// Each workspace and its folders, with what is on this PC and what is online only.
+#[tauri::command]
+async fn get_folders(fresh: Option<bool>, state: State<'_, AppState>) -> Result<sync::FolderOverview, String> {
+    match state.sync_engine.lock().await.as_ref() {
+        Some(engine) => Ok(engine.folder_overview(fresh.unwrap_or(false)).await),
+        None => Ok(sync::FolderOverview::default()),
+    }
+}
+
+/// Free Up Space for the whole sync folder, from the This PC page (the tray
+/// menu does the same). Folders kept "always on this PC" are left alone.
+#[tauri::command]
+async fn free_space(state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let (files, bytes) = sync::free_up_space(Some(engine), None).await?;
+    Ok(if files == 0 {
+        "Nothing to free: every file here is either kept on this PC or not backed up yet.".to_string()
+    } else {
+        format!("Freed {} on this PC ({} files). They open again with a click.", human_bytes(bytes), files)
+    })
+}
+
+fn human_bytes(b: u64) -> String {
+    let gb = b as f64 / 1_073_741_824.0;
+    if gb >= 1.0 { format!("{gb:.1} GB") } else { format!("{:.0} MB", b as f64 / 1_048_576.0) }
+}
+
+/// Drag a sound from the window into FL Studio (or anywhere that takes
+/// files). A file in the sync folder drags at once, even when it is online
+/// only: Windows fetches it when FL Studio reads it. Anything else downloads
+/// first and answers "downloaded", and the window asks for a second drag,
+/// because by then the mouse button is up.
+#[tauri::command]
+async fn drag_sound(workspace_id: String, file_id: String, name: String, window: WebviewWindow, state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let Some(path) = engine.local_path_for(&workspace_id, &file_id, &name).await else {
+        engine.cache_for_drag(&workspace_id, &file_id, &name).await?;
+        return Ok("downloaded".into());
+    };
+    start_native_drag(&window, path)?;
+    Ok("dragging".into())
+}
+
+#[cfg(windows)]
+fn start_native_drag(window: &WebviewWindow, path: std::path::PathBuf) -> Result<(), String> {
+    const ICON: &[u8] = include_bytes!("../icons/32x32.png");
+    let win = window.clone();
+    // DoDragDrop runs its own loop and must be on the window's thread.
+    window
+        .run_on_main_thread(move || {
+            if let Err(e) = drag::start_drag(&win, drag::DragItem::Files(vec![path]), drag::Image::Raw(ICON.to_vec()), |_, _| {}, drag::Options::default()) {
+                log::warn!("[Drag] {e}");
+            }
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(windows))]
+fn start_native_drag(_window: &WebviewWindow, _path: std::path::PathBuf) -> Result<(), String> {
+    Err("Dragging into FL Studio works on Windows.".into())
+}
+
+/// First start: whether "Set up this PC" is done, and what the sync folder's
+/// drive looks like. An install that already synced counts as set up, so an
+/// update does not greet an existing user with setup again.
+#[derive(serde::Serialize)]
+struct SetupState {
+    done: bool,
+    folder: String,
+    free_bytes: Option<u64>,
+    file_system: Option<String>,
+}
+
+fn setup_flag() -> std::path::PathBuf {
+    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("hardwave").join("workspace-setup-done")
+}
+
+#[tauri::command]
+fn get_setup() -> SetupState {
+    let root = sync::sync_root();
+    let done = setup_flag().exists() || !sync::read_index().is_empty();
+    let (free_bytes, file_system) = drive_info(&root);
+    SetupState { done, folder: root.to_string_lossy().to_string(), free_bytes, file_system }
+}
+
+/// Finish setup with the choice for what stays on this PC: "when_opened"
+/// (recommended), "always" or "online". Applied to every workspace folder;
+/// each folder can be changed later on the This PC page.
+#[tauri::command]
+async fn finish_setup(choice: pins::Mode, state: State<'_, AppState>) -> Result<(), String> {
+    if choice != pins::Mode::WhenOpened {
+        if let Some(engine) = state.sync_engine.lock().await.as_ref().cloned() {
+            let root = sync::sync_root();
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if e.path().is_dir() && !name.starts_with('.') {
+                        let _ = engine.set_folder_mode(&name, choice).await;
+                    }
+                }
+            }
+        }
+    }
+    let flag = setup_flag();
+    if let Some(dir) = flag.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(&flag, format!("{choice:?}")).map_err(|e| e.to_string())
+}
+
+/// Free space and file system of the drive holding `path` (Files On-Demand needs NTFS).
+#[cfg(windows)]
+fn drive_info(path: &std::path::Path) -> (Option<u64>, Option<String>) {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetVolumeInformationW};
+    let _ = std::fs::create_dir_all(path);
+    let w: Vec<u16> = path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free: u64 = 0;
+    let free_ok = unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }.is_ok();
+    let root: String = path.components().next().map(|c| format!("{}\\", c.as_os_str().to_string_lossy())).unwrap_or_default();
+    let root_w: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut fs_name = [0u16; 64];
+    let fs_ok = unsafe { GetVolumeInformationW(PCWSTR(root_w.as_ptr()), None, None, None, None, Some(&mut fs_name)) }.is_ok();
+    let fs = fs_ok.then(|| String::from_utf16_lossy(&fs_name).trim_end_matches('\0').to_string());
+    (free_ok.then_some(free), fs)
+}
+
+#[cfg(not(windows))]
+fn drive_info(_path: &std::path::Path) -> (Option<u64>, Option<String>) {
+    (None, None)
+}
+
+/// The last uploads, downloads and conflicts, for the tray panel.
+#[tauri::command]
+async fn get_recent(state: State<'_, AppState>) -> Result<Vec<sync::Activity>, String> {
+    match state.sync_engine.lock().await.as_ref() {
+        Some(engine) => Ok(engine.recent_activity().await),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Bring the main window up at a page of the app ("/pc" to settle a conflict).
+#[tauri::command]
+fn show_main(path: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(f) = app.get_webview_window("flyout") {
+        let _ = f.hide();
+    }
+    let win = app.get_webview_window("main").ok_or("The main window is gone.")?;
+    let _ = win.show();
+    let _ = win.unminimize();
+    let _ = win.set_focus();
+    if let Some(p) = path {
+        // Only a path inside the app, never a URL.
+        if p.starts_with('/') && !p.starts_with("//") && p.chars().all(|c| c.is_ascii_alphanumeric() || "/-_?=&".contains(c)) {
+            let _ = win.eval(format!("window.location.assign('{p}')"));
+        }
+    }
+    Ok(())
+}
+
+const FLYOUT_W: f64 = 360.0;
+const FLYOUT_H: f64 = 470.0;
+
+/// Left click on the tray icon: the small panel from the approved app mockup,
+/// next to the icon. Made on first use (a webview costs memory) and hidden
+/// again when it loses focus.
+fn toggle_flyout(app: &tauri::AppHandle, icon: tauri::Rect) {
+    use tauri::{LogicalSize, PhysicalPosition, WebviewUrl, WebviewWindowBuilder};
+    let win = match app.get_webview_window("flyout") {
+        Some(w) => {
+            if w.is_visible().unwrap_or(false) {
+                let _ = w.hide();
+                return;
+            }
+            w
+        }
+        None => {
+            let origin = api::ws_base().trim_end_matches("/api");
+            let Ok(url) = format!("{origin}/pc/flyout").parse() else { return };
+            match WebviewWindowBuilder::new(app, "flyout", WebviewUrl::External(url))
+                .title("Hardwave Workspace")
+                .inner_size(FLYOUT_W, FLYOUT_H)
+                .decorations(false)
+                .resizable(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .visible(false)
+                .build()
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    log::warn!("[Tray] panel: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    // Above the icon when the taskbar is at the bottom, below it when at the top.
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let size = LogicalSize::new(FLYOUT_W, FLYOUT_H).to_physical::<f64>(scale);
+    let pos = icon.position.to_physical::<f64>(scale);
+    let isize = icon.size.to_physical::<f64>(scale);
+    let monitor = win.current_monitor().ok().flatten().or_else(|| app.primary_monitor().ok().flatten());
+    let (mw, mh) = monitor.map(|m| (m.size().width as f64, m.size().height as f64)).unwrap_or((1920.0, 1080.0));
+    let x = (pos.x + isize.width / 2.0 - size.width / 2.0).clamp(8.0, (mw - size.width - 8.0).max(8.0));
+    let y = if pos.y > mh / 2.0 { pos.y - size.height - 8.0 } else { pos.y + isize.height + 8.0 };
+    let _ = win.set_position(PhysicalPosition::new(x, y.max(8.0)));
+    let _ = win.show();
+    let _ = win.set_focus();
+    let _ = win.eval("window.__HW_FLYOUT_REFRESH__ && window.__HW_FLYOUT_REFRESH__()");
+}
+
+/// Whether the app starts with Windows (in the tray, without a window).
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        return app.autolaunch().is_enabled().map_err(|e| e.to_string());
+    }
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        let l = app.autolaunch();
+        if enabled { l.enable() } else { l.disable() }.map_err(|e| e.to_string())?;
+        return l.is_enabled().map_err(|e| e.to_string());
+    }
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+/// "always", "when_opened" or "online" for one folder. Answers with a sentence for the window.
+#[tauri::command]
+async fn set_folder_mode(folder: String, mode: pins::Mode, state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    engine.set_folder_mode(&folder, mode).await
 }
 
 #[tauri::command]
@@ -540,6 +804,16 @@ pub fn run() {
                 app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
                 app.handle().plugin(tauri_plugin_process::init())?;
                 app.handle().plugin(tauri_plugin_dialog::init())?;
+                app.handle().plugin(tauri_plugin_autostart::init(
+                    tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                    Some(vec!["--minimized"]),
+                ))?;
+            }
+            // Started with Windows: sit in the tray, no window.
+            if std::env::args().any(|a| a == "--minimized") {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
             }
 
             // Build tray icon
@@ -560,6 +834,11 @@ pub fn run() {
                 // Left-click should open the app, the way every other tray app
                 // behaves; the menu stays on right-click.
                 .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, rect, .. } = event {
+                        toggle_flyout(tray.app_handle(), rect);
+                    }
+                })
                 .on_menu_event(|app, event| {
                     match event.id.as_ref() {
                         "open" => {
@@ -589,7 +868,7 @@ pub fn run() {
                                 let engine = tauri::async_runtime::block_on(async {
                                     app.state::<AppState>().sync_engine.lock().await.clone()
                                 });
-                                let msg = match tauri::async_runtime::block_on(sync::free_up_space(engine)) {
+                                let msg = match tauri::async_runtime::block_on(sync::free_up_space(engine, None)) {
                                     Ok((0, _)) => "Nothing to free up. Either every synced file is already a placeholder, or the rest are not on the server yet.".to_string(),
                                     Ok((n, b)) => format!(
                                         "Freed {:.2} GB across {} files. They stay in Explorer and download again when opened.",
@@ -708,11 +987,16 @@ pub fn run() {
         // placeholder in Explorer becomes unopenable, because nothing is left
         // to answer the hydration callback. Hide to the tray instead; Quit in
         // the tray menu is the deliberate way out.
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            // The tray panel closes when you click anywhere else.
+            tauri::WindowEvent::Focused(false) if window.label() == "flyout" => {
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             login,
@@ -720,6 +1004,18 @@ pub fn run() {
             get_auth_status,
             set_token,
             get_sync_status,
+            get_conflicts,
+            resolve_conflict,
+            get_folders,
+            set_folder_mode,
+            free_space,
+            get_autostart,
+            set_autostart,
+            drag_sound,
+            get_setup,
+            finish_setup,
+            get_recent,
+            show_main,
             pause_sync,
             resume_sync,
             get_sync_folder,
