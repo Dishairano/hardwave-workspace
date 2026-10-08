@@ -51,7 +51,3 @@ certbot --nginx -d workspace.hardwavestudios.com
 
 ## ERP Project
 Track progress at: erp.hardwavestudios.com → Projects → HW-WORKSPACE-V1 (ID: 11)
-
-## Document Archive
-API key: `540f288f51ee8029e2d9c085c4ea0b58880dfdde8c68b33b66847829cbd5235e`  
-Docs: https://erp.hardwavestudios.com/api/erp/archive/docs
