@@ -1217,9 +1217,16 @@ impl SyncEngine {
                     Err(e) => {
                         eprintln!("[SSE] Connect error: {}", redact_token(&e.to_string()));
                     }
-                    Ok(resp) if !resp.status().is_success() => {
+                    Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                        || resp.status() == reqwest::StatusCode::FORBIDDEN => {
                         eprintln!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
-                        return; // 401/403 — don't retry, token is gone
+                        return; // 401/403: the token is gone, retrying will not help
+                    }
+                    Ok(resp) if !resp.status().is_success() => {
+                        // Maintenance (503) or a server error: keep trying with backoff.
+                        // This used to stop the stream for good, so live updates only
+                        // came back after the app was restarted.
+                        eprintln!("[SSE] Server answered {} for workspace {}; retrying", resp.status(), workspace_id);
                     }
                     Ok(resp) => {
                         backoff_ms = 2_000; // reset on successful connect

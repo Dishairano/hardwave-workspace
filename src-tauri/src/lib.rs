@@ -1,4 +1,5 @@
 mod cloudfiles;
+mod device;
 mod hydration;
 mod api;
 mod models;
@@ -664,6 +665,12 @@ pub fn run() {
                 // Wait for webview to load
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 start_token_bridge(bridge_handle).await;
+            });
+
+            // Tell Workspace how this computer's sync is doing (Home shows it per computer).
+            let device_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                device::run(device_handle).await;
             });
 
             // Initialize sync engine
