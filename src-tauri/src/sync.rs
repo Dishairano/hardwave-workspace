@@ -70,14 +70,24 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Validate that a path component is safe (no path traversal).
+/// Validate that a path component is safe (no path traversal). A ':' would
+/// read as a drive ("C:") or an alternate data stream on Windows.
 fn is_safe_component(name: &str) -> bool {
-    !name.contains("..") && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
+        && !name.chars().any(char::is_control)
 }
 
-/// Validate that a relative path is safe (allows `/` separators, rejects traversal).
-fn is_safe_rel_path(path: &str) -> bool {
-    !path.contains("..") && !path.contains('\\') && !path.contains('\0')
+/// Validate that a relative path is safe: `/`-separated components, each one
+/// safe, so joining it to the sync root can never leave the sync root. Every
+/// remote file's path goes through this before anything is written; a
+/// workspace editor chooses those names (launch audit 2026-10-08).
+pub(crate) fn is_safe_rel_path(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(is_safe_component)
 }
 
 /// Scan the sync root and return all files with their hashes.
@@ -554,8 +564,12 @@ impl SyncEngine {
                 let dir = path.parent().ok_or("The file has no folder.")?.to_path_buf();
                 let name = path.file_name().and_then(|n| n.to_str()).ok_or("The file name cannot be read.")?;
                 let kept = conflicts::kept_name(name, &crate::device::device_name(), |n| dir.join(n).exists());
-                std::fs::rename(&path, dir.join(&kept))
-                    .map_err(|e| format!("This PC's copy could not be renamed (is it open?): {e}"))?;
+                // An earlier try may have renamed it already and then failed to
+                // download; then only the download is left to do.
+                if path.exists() {
+                    std::fs::rename(&path, dir.join(&kept))
+                        .map_err(|e| format!("This PC's copy could not be renamed (is it open?): {e}"))?;
+                }
                 let entry = self.download_replace(&token, &c.workspace_id, &c.remote_id, rel_path).await?;
                 self.index_put(entry).await;
                 // The renamed copy is a new file; the next pass uploads it.
@@ -687,7 +701,15 @@ impl SyncEngine {
     /// was, and a 2 GB recording never sits in memory (the old download read
     /// the whole body into memory and wrote straight over the file).
     async fn download_replace(&self, token: &str, ws_id: &str, file_id: &str, rel_path: &str) -> Result<SyncEntry, String> {
+        if !is_safe_rel_path(rel_path) {
+            return Err(format!("unsafe path {rel_path}"));
+        }
         let dest = sync_root().join(rel_path);
+        // What is at the path now. If it changes while the download runs (FL
+        // Studio saved it), the download is thrown away instead of written
+        // over that save; the next pass sees both sides changed.
+        let stamp = |p: &Path| p.metadata().ok().map(|m| (m.len(), file_mtime(p)));
+        let before = stamp(&dest);
         let dir = dest.parent().ok_or("no folder")?.to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let name = dest.file_name().and_then(|n| n.to_str()).ok_or("bad file name")?;
@@ -698,6 +720,10 @@ impl SyncEngine {
         for attempt in 0..3u32 {
             match stream_to_file(token, ws_id, file_id, &tmp).await {
                 Ok((sha, size)) => {
+                    if stamp(&dest) != before {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(format!("{rel_path} changed on this PC during the download; left as it is"));
+                    }
                     self.self_writes.lock().await.insert(rel_path.to_string(), sha.clone());
                     if let Err(e) = std::fs::rename(&tmp, &dest) {
                         let _ = std::fs::remove_file(&tmp);
@@ -926,10 +952,20 @@ impl SyncEngine {
         };
 
         // Another PC may have saved a newer version that this one has not
-        // pulled yet. Uploading now would bury it under this one.
+        // pulled yet. Uploading now would bury it under this one. The check
+        // fails closed: when it cannot be made, nothing is uploaded and the
+        // next pass tries again (launch audit 2026-10-08).
         if !force {
+            // A file this PC never synced may already exist in Workspace under
+            // the same path, as an old copy on a second PC does. Only the full
+            // pass, which holds the server's list, may decide that one.
+            if known.is_none() {
+                self.sse_trigger.notify_one();
+                return Ok(());
+            }
             if let Some((entry_sha, Some(remote_id), Some(ws_id))) = &known {
-                if let Ok(Some(remote)) = api::file_state(&token, ws_id, remote_id).await {
+                let state = api::file_state(&token, ws_id, remote_id).await?;
+                if let Some(remote) = state {
                     let remote_sha = remote.sha256.clone();
                     if remote_sha.as_deref() != Some(sha.as_str())
                         && !conflicts::may_upload(Some(entry_sha), Some(remote_sha.as_deref()))
@@ -1101,15 +1137,49 @@ impl SyncEngine {
             // of every remote file by path is kept for the upload scan.
             type Remembered = Option<(String, u64, Option<i64>)>;
             let mut remote_sha_by_rel: HashMap<String, Option<String>> = HashMap::new();
+            let rel_of = |rf: &api::WorkspaceFile| {
+                let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
+                if folder.is_empty() {
+                    format!("{}/{}", ws.name, rf.name)
+                } else {
+                    format!("{}/{}/{}", ws.name, folder, rf.name)
+                }
+            };
+            // Several server rows can land on one path here: folders whose
+            // stored path is wrong (635 in production on 2026-10-08) and names
+            // that differ only in case, which Windows treats as one file.
+            // Deciding each row separately replaced the file with the other row
+            // on alternate passes. The newest row wins; the others are left
+            // alone. A path that would leave the sync folder is never used.
+            let mut newest_by_path: HashMap<String, usize> = HashMap::new();
+            let (mut unsafe_paths, mut collapsed) = (0usize, 0usize);
+            for (i, rf) in remote_files.iter().enumerate() {
+                let rel = rel_of(rf);
+                if !is_safe_rel_path(&rel) {
+                    unsafe_paths += 1;
+                    continue;
+                }
+                let key = rel.to_lowercase();
+                match newest_by_path.get(&key) {
+                    Some(&j) if remote_files[j].updated_at >= rf.updated_at => collapsed += 1,
+                    Some(_) => {
+                        collapsed += 1;
+                        newest_by_path.insert(key, i);
+                    }
+                    None => {
+                        newest_by_path.insert(key, i);
+                    }
+                }
+            }
+            if unsafe_paths + collapsed > 0 {
+                eprintln!("[Sync] '{}': {} unsafe path(s) skipped, {} duplicate path(s) folded into the newest", ws.name, unsafe_paths, collapsed);
+            }
+            let mut chosen: Vec<usize> = newest_by_path.into_values().collect();
+            chosen.sort_unstable();
             let to_download: Vec<(String, api::WorkspaceFile, Remembered)> = {
                 let idx = self.index.lock().await;
-                remote_files.iter().filter_map(|rf| {
-                    let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
-                    let rel_path = if folder.is_empty() {
-                        format!("{}/{}", ws.name, rf.name)
-                    } else {
-                        format!("{}/{}/{}", ws.name, folder, rf.name)
-                    };
+                chosen.iter().map(|&i| &remote_files[i]).filter_map(|rf| {
+                    let rel_path = rel_of(rf);
                     remote_sha_by_rel.insert(rel_path.clone(), rf.sha256.clone().filter(|h| !h.is_empty()));
                     let entry = idx.get(&rel_path);
                     let should = match entry {
@@ -2403,6 +2473,24 @@ fn prune_empty_dirs(dir: &Path) {
 #[cfg(test)]
 mod redact_token_tests {
     use super::redact_token;
+
+    #[test]
+    fn paths_from_the_server_never_leave_the_sync_folder() {
+        assert!(super::is_safe_rel_path("Studio/FL Studio/Face Of Fire.flp"));
+        assert!(super::is_safe_rel_path("Studio/a..b.wav"));
+        for bad in [
+            "Studio/../../AppData/x.bat",
+            "Studio/..\\..\\Startup\\x.bat",
+            "C:/Windows/x.dll",
+            "Studio/C:x.bat",
+            "/etc/passwd",
+            "Studio//x.wav",
+            "Studio/./x.wav",
+            "",
+        ] {
+            assert!(!super::is_safe_rel_path(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn takes_the_token_out_of_a_url() {

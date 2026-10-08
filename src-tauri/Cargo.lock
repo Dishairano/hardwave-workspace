@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "hardwave-workspace"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
