@@ -23,6 +23,16 @@ pub struct AppState {
     pub auto_sync: TokioMutex<bool>,
 }
 
+impl AppState {
+    /// The running engine, without holding the lock while it works. Commands
+    /// used to await engine calls inside the lock, so one slow call (the
+    /// folder overview walks the whole sync folder) froze status, pause and
+    /// every other command until it finished (Windows test 2026-10-09).
+    pub async fn engine(&self) -> Option<Arc<sync::SyncEngine>> {
+        self.sync_engine.lock().await.clone()
+    }
+}
+
 /// Safely call a frontend function with serializable data.
 /// Embeds JSON directly as a JS expression (valid JSON is valid JS).
 pub fn safe_eval<T: serde::Serialize>(win: &WebviewWindow, fn_name: &str, data: &T) {
@@ -175,7 +185,7 @@ async fn login(
         if let Some(ref token) = res.token {
             *state.api_token.lock().await = Some(token.clone());
             sync_vst_token(Some(token));
-            if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+            if let Some(engine) = state.engine().await.as_ref() {
                 engine.set_token(Some(token.clone())).await;
             }
         }
@@ -191,7 +201,7 @@ async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     }
     *state.api_token.lock().await = None;
     sync_vst_token(None);
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         engine.set_token(None).await;
     }
     Ok(())
@@ -210,7 +220,7 @@ async fn get_auth_status(state: State<'_, AppState>) -> Result<bool, String> {
 async fn set_token(token: String, state: State<'_, AppState>) -> Result<(), String> {
     *state.api_token.lock().await = Some(token.clone());
     sync_vst_token(Some(&token));
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         engine.set_token(Some(token)).await;
     }
     Ok(())
@@ -219,7 +229,7 @@ async fn set_token(token: String, state: State<'_, AppState>) -> Result<(), Stri
 /// Files changed on this PC and in Workspace before they synced (conflicts.rs).
 #[tauri::command]
 async fn get_conflicts(state: State<'_, AppState>) -> Result<Vec<conflicts::Conflict>, String> {
-    match state.sync_engine.lock().await.as_ref() {
+    match state.engine().await.as_ref() {
         Some(engine) => Ok(engine.list_conflicts().await),
         None => Ok(Vec::new()),
     }
@@ -229,14 +239,14 @@ async fn get_conflicts(state: State<'_, AppState>) -> Result<Vec<conflicts::Conf
 /// sentence for the window to show.
 #[tauri::command]
 async fn resolve_conflict(rel_path: String, choice: conflicts::Choice, state: State<'_, AppState>) -> Result<String, String> {
-    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let engine = state.engine().await.ok_or("Sync has not started yet.")?;
     engine.resolve_conflict(&rel_path, choice).await
 }
 
 /// Each workspace and its folders, with what is on this PC and what is online only.
 #[tauri::command]
 async fn get_folders(fresh: Option<bool>, state: State<'_, AppState>) -> Result<sync::FolderOverview, String> {
-    match state.sync_engine.lock().await.as_ref() {
+    match state.engine().await.as_ref() {
         Some(engine) => Ok(engine.folder_overview(fresh.unwrap_or(false)).await),
         None => Ok(sync::FolderOverview::default()),
     }
@@ -246,7 +256,7 @@ async fn get_folders(fresh: Option<bool>, state: State<'_, AppState>) -> Result<
 /// menu does the same). Folders kept "always on this PC" are left alone.
 #[tauri::command]
 async fn free_space(state: State<'_, AppState>) -> Result<String, String> {
-    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let engine = state.engine().await.ok_or("Sync has not started yet.")?;
     let (files, bytes) = sync::free_up_space(Some(engine), None).await?;
     Ok(if files == 0 {
         "Nothing to free: every file here is either kept on this PC or not backed up yet.".to_string()
@@ -267,7 +277,7 @@ fn human_bytes(b: u64) -> String {
 /// because by then the mouse button is up.
 #[tauri::command]
 async fn drag_sound(workspace_id: String, file_id: String, name: String, window: WebviewWindow, state: State<'_, AppState>) -> Result<String, String> {
-    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let engine = state.engine().await.ok_or("Sync has not started yet.")?;
     let Some(path) = engine.local_path_for(&workspace_id, &file_id, &name).await else {
         engine.cache_for_drag(&workspace_id, &file_id, &name).await?;
         return Ok("downloaded".into());
@@ -336,7 +346,7 @@ fn get_device_name() -> String {
 #[tauri::command]
 async fn finish_setup(choice: pins::Mode, state: State<'_, AppState>) -> Result<(), String> {
     if choice != pins::Mode::WhenOpened {
-        if let Some(engine) = state.sync_engine.lock().await.as_ref().cloned() {
+        if let Some(engine) = state.engine().await {
             let root = sync::sync_root();
             if let Ok(entries) = std::fs::read_dir(&root) {
                 for e in entries.flatten() {
@@ -380,7 +390,7 @@ fn drive_info(_path: &std::path::Path) -> (Option<u64>, Option<String>) {
 /// The last uploads, downloads and conflicts, for the tray panel.
 #[tauri::command]
 async fn get_recent(state: State<'_, AppState>) -> Result<Vec<sync::Activity>, String> {
-    match state.sync_engine.lock().await.as_ref() {
+    match state.engine().await.as_ref() {
         Some(engine) => Ok(engine.recent_activity().await),
         None => Ok(Vec::new()),
     }
@@ -485,13 +495,13 @@ fn set_autostart(enabled: bool, app: tauri::AppHandle) -> Result<bool, String> {
 /// "always", "when_opened" or "online" for one folder. Answers with a sentence for the window.
 #[tauri::command]
 async fn set_folder_mode(folder: String, mode: pins::Mode, state: State<'_, AppState>) -> Result<String, String> {
-    let engine = state.sync_engine.lock().await.as_ref().cloned().ok_or("Sync has not started yet.")?;
+    let engine = state.engine().await.ok_or("Sync has not started yet.")?;
     engine.set_folder_mode(&folder, mode).await
 }
 
 #[tauri::command]
 async fn get_sync_status(state: State<'_, AppState>) -> Result<SyncStatus, String> {
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         Ok(engine.get_status().await)
     } else {
         Ok(SyncStatus {
@@ -511,7 +521,7 @@ async fn get_sync_status(state: State<'_, AppState>) -> Result<SyncStatus, Strin
 
 #[tauri::command]
 async fn pause_sync(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         engine.pause().await;
     }
     Ok(())
@@ -519,7 +529,7 @@ async fn pause_sync(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn resume_sync(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         engine.resume().await;
     }
     Ok(())
@@ -612,7 +622,7 @@ async fn download_file(
 #[tauri::command]
 async fn toggle_auto_sync(enabled: bool, state: State<'_, AppState>) -> Result<(), String> {
     *state.auto_sync.lock().await = enabled;
-    if let Some(engine) = state.sync_engine.lock().await.as_ref() {
+    if let Some(engine) = state.engine().await.as_ref() {
         if enabled {
             engine.resume().await;
         } else {
@@ -661,7 +671,7 @@ async fn archive_start(
     workspace_id: Option<String>,
     dest_folder: Option<String>,
 ) -> Result<sync::ArchiveReport, String> {
-    let engine = state.sync_engine.lock().await.clone()
+    let engine = state.engine().await
         .ok_or_else(|| "Sign in first".to_string())?;
     sync::archive_folder(engine, std::path::PathBuf::from(path), workspace_id, dest_folder).await
 }
@@ -734,7 +744,7 @@ async fn check_for_updates(handle: tauri::AppHandle) {
     let updater = match handle.updater() {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("[Workspace] Failed to get updater: {}", e);
+            log::warn!("[Workspace] Failed to get updater: {}", e);
             return;
         }
     };
@@ -743,7 +753,7 @@ async fn check_for_updates(handle: tauri::AppHandle) {
         Ok(Some(update)) => update,
         Ok(None) => return,
         Err(e) => {
-            eprintln!("[Workspace] Update check failed: {}", e);
+            log::warn!("[Workspace] Update check failed: {}", e);
             return;
         }
     };
@@ -888,7 +898,7 @@ pub fn run() {
                                         b as f64 / 1_073_741_824.0, n),
                                     Err(e) => format!("Could not free up space: {e}"),
                                 };
-                                eprintln!("[FreeSpace] {msg}");
+                                log::info!("[FreeSpace] {msg}");
 
                                 // Report through a native notification. The
                                 // webview toast below cannot be the only channel:
@@ -906,7 +916,7 @@ pub fn run() {
                                     .body(&msg)
                                     .show()
                                 {
-                                    eprintln!("[FreeSpace] notification failed: {e}");
+                                    log::warn!("[FreeSpace] notification failed: {e}");
                                 }
 
                                 if let Some(win) = app.get_webview_window("main") {
@@ -930,8 +940,7 @@ pub fn run() {
                             let handle = app.clone();
                             tauri::async_runtime::spawn(async move {
                                 let app_state = handle.state::<AppState>();
-                                let guard = app_state.sync_engine.lock().await;
-                                if let Some(engine) = guard.as_ref() {
+                                if let Some(engine) = app_state.engine().await {
                                     engine.pause().await;
                                 }
                             });

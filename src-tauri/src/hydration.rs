@@ -57,7 +57,7 @@ mod imp {
     /// Hydration failures are invisible in a GUI app, so mirror them to a file
     /// next to the app data where they can actually be read.
     fn log_line(msg: &str) {
-        eprintln!("[Hydration] {msg}");
+        log::info!("[Hydration] {msg}");
         if let Ok(dir) = std::env::var("LOCALAPPDATA") {
             let p = std::path::Path::new(&dir).join("hardwave-workspace-hydration.log");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {

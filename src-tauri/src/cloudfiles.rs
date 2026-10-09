@@ -247,7 +247,7 @@ mod imp {
             if created == 0 {
                 return Err(err(e.code(), "CfCreatePlaceholders"));
             }
-            eprintln!(
+            log::warn!(
                 "[CloudFiles] {} of {} placeholders created; failures: {}",
                 created,
                 files.len(),

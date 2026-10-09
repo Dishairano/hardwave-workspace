@@ -58,7 +58,7 @@ pub async fn with_retry<T>(
             Ok(val) => return Ok(val),
             Err(e) => {
                 last_err = e;
-                eprintln!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
+                log::warn!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
             }
         }
     }
@@ -647,7 +647,7 @@ async fn send_part(
             Ok(Err(e)) => last_err = format!("part {number}: {e}"),
             Err(_) => last_err = format!("part {number}: timed out after {} s", deadline.as_secs()),
         }
-        eprintln!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
+        log::warn!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
     }
     Err(format!("Upload failed at part {number}: {last_err}"))
 }
