@@ -54,6 +54,24 @@ mod imp {
     pub fn dehydrate(_path: &Path, _identity: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
+    pub fn refresh_placeholder(_root: &Path, _rel_path: &str, _size: u64, _identity: &str) -> Result<(), String> {
+        Err("Files On-Demand is Windows only".into())
+    }
+    pub fn set_pin(_path: &Path, _pin: Pin) -> Result<(), String> {
+        Err("Files On-Demand is Windows only".into())
+    }
+    pub fn hydrate(_path: &Path) -> Result<(), String> {
+        Err("Files On-Demand is Windows only".into())
+    }
+}
+
+/// What Explorer shows and Windows does for a file or folder: always here (●),
+/// here until space is freed (✓), or online only (☁).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pin {
+    Pinned,
+    Unspecified,
+    Unpinned,
 }
 
 #[cfg(windows)]
@@ -229,7 +247,7 @@ mod imp {
             if created == 0 {
                 return Err(err(e.code(), "CfCreatePlaceholders"));
             }
-            eprintln!(
+            log::warn!(
                 "[CloudFiles] {} of {} placeholders created; failures: {}",
                 created,
                 files.len(),
@@ -280,6 +298,74 @@ mod imp {
             Ok(n) => Err(format!("created {n} placeholders for one file")),
             Err(e) => Err(e),
         }
+    }
+
+    /// A cloud-only placeholder whose file changed in Workspace: it still
+    /// carries the old size, and Windows refuses to hydrate data that does not
+    /// match it. It holds no bytes, so it is removed and made again.
+    pub fn refresh_placeholder(root: &Path, rel_path: &str, size: u64, identity: &str) -> Result<(), String> {
+        let path = root.join(rel_path.replace('/', "\\"));
+        if !is_placeholder(&path) {
+            return Err(format!("{} is not a cloud-only placeholder", path.display()));
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+        let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let file = RemoteFile { rel_path: rel_path.to_string(), size, identity: identity.to_string() };
+        match create_placeholders(root, dir, &[file]) {
+            Ok(1) => Ok(()),
+            Ok(n) => Err(format!("created {n} placeholders for one file")),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_rw(path: &Path) -> Result<windows::Win32::Foundation::HANDLE, String> {
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let path_w = wide(&path.to_string_lossy());
+        unsafe {
+            CreateFileW(
+                PCWSTR(path_w.as_ptr()),
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                // Needed to open a folder, harmless for a file.
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        }
+        .map_err(|e| format!("open {}: {e}", path.display()))
+    }
+
+    /// Set the pin state of a file, or of a folder and everything in it. This
+    /// is what Explorer's "Always keep on this device" and "Free up space" set;
+    /// keeping the bytes to match is the caller's job (hydrate / dehydrate).
+    pub fn set_pin(path: &Path, pin: Pin) -> Result<(), String> {
+        use windows::Win32::Foundation::CloseHandle;
+        let state = match pin {
+            Pin::Pinned => CF_PIN_STATE_PINNED,
+            Pin::Unspecified => CF_PIN_STATE_UNSPECIFIED,
+            Pin::Unpinned => CF_PIN_STATE_UNPINNED,
+        };
+        let flags = if path.is_dir() { CF_SET_PIN_FLAG_RECURSE } else { CF_SET_PIN_FLAG_NONE };
+        let handle = open_rw(path)?;
+        let res = unsafe { CfSetPinState(handle, state, flags, None) }.map_err(|e| err(e.code(), "CfSetPinState"));
+        unsafe { let _ = CloseHandle(handle); }
+        res
+    }
+
+    /// Bring a cloud-only placeholder's bytes onto this PC, through the same
+    /// hydration callback that serves Explorer.
+    pub fn hydrate(path: &Path) -> Result<(), String> {
+        use windows::Win32::Foundation::CloseHandle;
+        let handle = open_rw(path)?;
+        // Length -1 means the whole file.
+        let res = unsafe { CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None) }
+            .map_err(|e| err(e.code(), "CfHydratePlaceholder"));
+        unsafe { let _ = CloseHandle(handle); }
+        res
     }
 
     pub fn dehydrate(path: &Path, identity: &str) -> Result<(), String> {
@@ -361,6 +447,6 @@ mod imp {
 
 #[allow(unused_imports)]
 pub use imp::{
-    create_placeholders, dehydrate, is_placeholder, is_supported, register,
-    replace_with_placeholder, unregister,
+    create_placeholders, dehydrate, hydrate, is_placeholder, is_supported, refresh_placeholder, register,
+    replace_with_placeholder, set_pin, unregister,
 };

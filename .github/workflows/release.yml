@@ -88,7 +88,9 @@ jobs:
 
             Download the installer for your platform below.
           releaseDraft: false
-          prerelease: false
+          # A tag with a suffix (v0.2.21-beta.1) is a beta: a GitHub prerelease, which
+          # releases/latest (the updater's feed) skips, so only testers get it.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Upload installers (manual runs only)

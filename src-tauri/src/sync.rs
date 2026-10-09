@@ -5,6 +5,8 @@
 
 use crate::api;
 use futures_util::stream::StreamExt as _;
+use crate::conflicts::{self, Conflict, Indexed, Local, RemoteAction};
+use crate::pins;
 use crate::models::{SyncEntry, SyncStatus};
 use notify::{RecursiveMode, Watcher, Event, EventKind};
 use sha2::{Sha256, Digest};
@@ -68,14 +70,24 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Validate that a path component is safe (no path traversal).
+/// Validate that a path component is safe (no path traversal). A ':' would
+/// read as a drive ("C:") or an alternate data stream on Windows.
 fn is_safe_component(name: &str) -> bool {
-    !name.contains("..") && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains(':')
+        && !name.chars().any(char::is_control)
 }
 
-/// Validate that a relative path is safe (allows `/` separators, rejects traversal).
-fn is_safe_rel_path(path: &str) -> bool {
-    !path.contains("..") && !path.contains('\\') && !path.contains('\0')
+/// Validate that a relative path is safe: `/`-separated components, each one
+/// safe, so joining it to the sync root can never leave the sync root. Every
+/// remote file's path goes through this before anything is written; a
+/// workspace editor chooses those names (launch audit 2026-10-08).
+pub(crate) fn is_safe_rel_path(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(is_safe_component)
 }
 
 /// Scan the sync root and return all files with their hashes.
@@ -273,11 +285,14 @@ fn scan_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u
         {
             continue;
         }
+        let rel_str = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        // node_modules, temporary files and the like (rules.rs).
+        if crate::rules::is_excluded(&rel_str) {
+            continue;
+        }
         if path.is_dir() {
             scan_dir_recursive(root, &path, out);
         } else if let Ok(meta) = path.metadata() {
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
             out.push((rel_str, path.clone(), meta.len()));
         }
     }
@@ -299,6 +314,32 @@ pub struct SyncEngine {
     disk_cache: RwLock<Option<(std::time::Instant, u32, u64)>>,
     /// How many uploads to run at once right now (see UPLOAD_PARALLEL).
     upload_parallel: AtomicUsize,
+    /// Files changed here and in Workspace before they synced (conflicts.rs),
+    /// waiting for the producer. Kept on disk so a restart does not forget them.
+    conflicts: Arc<Mutex<HashMap<String, Conflict>>>,
+    /// Files the engine itself just wrote, with their hash, so the watcher does
+    /// not upload a download straight back.
+    self_writes: Arc<Mutex<HashMap<String, String>>>,
+    /// What stays on this PC, per folder (pins.rs).
+    modes: Arc<Mutex<HashMap<String, pins::Mode>>>,
+    /// Cached folder overview for the This PC page (walking 100k files takes seconds).
+    overview_cache: Mutex<Option<(std::time::Instant, FolderOverview)>>,
+    /// The last things that moved, for the tray panel.
+    recent: Mutex<std::collections::VecDeque<Activity>>,
+    /// Folder names of the signed-in account's workspaces, from the last full
+    /// pass. The sync folder can also hold another account's workspaces (two
+    /// accounts on one PC); totals and the folder list leave those out.
+    /// None until the first pass has listed the workspaces.
+    own_workspaces: RwLock<Option<Vec<String>>>,
+}
+
+/// One line in the tray panel: "↑ Face Of Fire.flp, 4 min ago".
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Activity {
+    /// "up", "down" or "conflict".
+    pub kind: &'static str,
+    pub rel_path: String,
+    pub at: String,
 }
 
 impl SyncEngine {
@@ -326,7 +367,24 @@ impl SyncEngine {
             sse_handles: Mutex::new(Vec::new()),
             sse_trigger: Arc::new(tokio::sync::Notify::new()),
             disk_cache: RwLock::new(None),
+            conflicts: Arc::new(Mutex::new(conflicts::load())),
+            self_writes: Arc::new(Mutex::new(HashMap::new())),
+            modes: Arc::new(Mutex::new(pins::load())),
+            overview_cache: Mutex::new(None),
+            own_workspaces: RwLock::new(None),
+            recent: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    async fn note(&self, kind: &'static str, rel_path: &str) {
+        let mut r = self.recent.lock().await;
+        r.push_front(Activity { kind, rel_path: rel_path.to_string(), at: chrono::Utc::now().to_rfc3339() });
+        r.truncate(20);
+    }
+
+    /// Newest first.
+    pub async fn recent_activity(&self) -> Vec<Activity> {
+        self.recent.lock().await.iter().cloned().collect()
     }
 
     pub async fn set_token(&self, token: Option<String>) {
@@ -346,12 +404,12 @@ impl SyncEngine {
                 if let Ok(workspaces) = api::list_workspaces(&t).await {
                     for ws in &workspaces {
                         if !is_safe_component(&ws.name) {
-                            eprintln!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
+                            log::info!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
                             continue;
                         }
                         let ws_dir = root.join(&ws.name);
                         let _ = std::fs::create_dir_all(&ws_dir);
-                        eprintln!("[Sync] Created workspace folder: {}", ws_dir.display());
+                        log::info!("[Sync] Created workspace folder: {}", ws_dir.display());
                         if let Ok(folders) = api::list_folders(&t, &ws.id).await {
                             for f in &folders {
                                 let folder_path = f.path.as_deref()
@@ -360,7 +418,7 @@ impl SyncEngine {
                                 if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                                     let dir = ws_dir.join(folder_path);
                                     let _ = std::fs::create_dir_all(&dir);
-                                    eprintln!("[Sync] Created subfolder: {}", dir.display());
+                                    log::info!("[Sync] Created subfolder: {}", dir.display());
                                 }
                             }
                         }
@@ -423,15 +481,20 @@ impl SyncEngine {
                 return (f, b);
             }
         }
-        let (f, b) = tokio::task::spawn_blocking(Self::scan_disk_totals)
+        let own = self.own_workspaces.read().await.clone();
+        let (f, b) = tokio::task::spawn_blocking(move || Self::scan_disk_totals(own.as_deref()))
             .await
             .unwrap_or((0, 0));
         *self.disk_cache.write().await = Some((std::time::Instant::now(), f, b));
         (f, b)
     }
 
-    fn scan_disk_totals() -> (u32, u64) {
-        let files = scan_local(&sync_root());
+    fn scan_disk_totals(own: Option<&[String]>) -> (u32, u64) {
+        let root = sync_root();
+        let files = match own {
+            Some(names) => names.iter().flat_map(|n| scan_local(&root.join(n))).collect(),
+            None => scan_local(&root),
+        };
         let bytes: u64 = files.iter().map(|(_, _, s)| *s).sum();
         (files.len() as u32, bytes)
     }
@@ -454,17 +517,253 @@ impl SyncEngine {
         }
     }
 
-    /// Emit a conflict warning to the webview.
-    fn emit_conflict(&self, rel_path: &str, local_size: u64, remote_size: u64) {
-        if let Some(win) = self.app.get_webview_window("main") {
-            crate::safe_eval(&win, "__HW_SYNC_CONFLICTS__", &serde_json::json!({
-                "rel_path": rel_path,
-                "local_size": local_size,
-                "remote_size": remote_size,
-                "time": chrono::Utc::now().timestamp_millis(),
-            }));
+    /// Record a conflict once, tell the window, and keep it on disk.
+    async fn add_conflict(&self, c: Conflict) {
+        let list = {
+            let mut all = self.conflicts.lock().await;
+            if all.contains_key(&c.rel_path) {
+                return;
+            }
+            log::info!(
+                "[Sync] Conflict: '{}' changed here ({} bytes) and in Workspace ({} bytes)",
+                c.rel_path, c.local_size, c.remote_size
+            );
+            all.insert(c.rel_path.clone(), c.clone());
+            conflicts::save(&all);
+            all.values().cloned().collect::<Vec<_>>()
+        };
+        self.note("conflict", &c.rel_path).await;
+        let _ = self.app.emit("sync:conflicts", list);
+    }
+
+    /// Conflicts waiting for the producer, newest first.
+    pub async fn list_conflicts(&self) -> Vec<Conflict> {
+        let mut list: Vec<Conflict> = self.conflicts.lock().await.values().cloned().collect();
+        list.sort_by(|a, b| b.detected_at.cmp(&a.detected_at));
+        list
+    }
+
+    /// Settle one conflict the way the producer chose. Nothing is thrown away:
+    /// Workspace keeps every earlier version, and a copy of this PC's file
+    /// that is replaced goes to the Recycle Bin.
+    pub async fn resolve_conflict(&self, rel_path: &str, choice: conflicts::Choice) -> Result<String, String> {
+        let token = self.token.read().await.clone().ok_or("Sign in first.")?;
+        let c = self
+            .conflicts
+            .lock()
+            .await
+            .get(rel_path)
+            .cloned()
+            .ok_or("This one is already settled.")?;
+        let path = sync_root().join(rel_path);
+
+        let message = match choice {
+            conflicts::Choice::Local => {
+                self.sync_local_file(rel_path, true).await?;
+                "This PC's version is now the newest in Workspace. The other one stays in its versions.".to_string()
+            }
+            conflicts::Choice::Remote => {
+                if path.exists() {
+                    trash::delete(&path)
+                        .map_err(|e| format!("This PC's copy could not go to the Recycle Bin, so nothing changed: {e}"))?;
+                }
+                let entry = self.download_replace(&token, &c.workspace_id, &c.remote_id, rel_path).await?;
+                self.index_put(entry).await;
+                "Workspace's version is on this PC. This PC's copy is in the Recycle Bin.".to_string()
+            }
+            conflicts::Choice::Both => {
+                let dir = path.parent().ok_or("The file has no folder.")?.to_path_buf();
+                let name = path.file_name().and_then(|n| n.to_str()).ok_or("The file name cannot be read.")?;
+                let kept = conflicts::kept_name(name, &crate::device::device_name(), |n| dir.join(n).exists());
+                // An earlier try may have renamed it already and then failed to
+                // download; then only the download is left to do.
+                if path.exists() {
+                    std::fs::rename(&path, dir.join(&kept))
+                        .map_err(|e| format!("This PC's copy could not be renamed (is it open?): {e}"))?;
+                }
+                let entry = self.download_replace(&token, &c.workspace_id, &c.remote_id, rel_path).await?;
+                self.index_put(entry).await;
+                // The renamed copy is a new file; the next pass uploads it.
+                format!("Both kept. This PC's copy is now \"{kept}\".")
+            }
+        };
+
+        let list = {
+            let mut all = self.conflicts.lock().await;
+            all.remove(rel_path);
+            conflicts::save(&all);
+            all.values().cloned().collect::<Vec<_>>()
+        };
+        let _ = self.app.emit("sync:conflicts", list);
+        self.sse_trigger.notify_one();
+        Ok(message)
+    }
+
+    /// The folders of the This PC page: each workspace and its top-level
+    /// folders, with how much is on this PC, how much is online only, and the
+    /// mode that governs it. Cached for a minute.
+    pub async fn folder_overview(&self, fresh: bool) -> FolderOverview {
+        if !fresh {
+            if let Some((t, o)) = &*self.overview_cache.lock().await {
+                if t.elapsed() < std::time::Duration::from_secs(60) {
+                    return o.clone();
+                }
+            }
         }
-        eprintln!("[Sync] CONFLICT: '{}' exists locally ({} bytes) but differs from remote ({} bytes)", rel_path, local_size, remote_size);
+        let modes = self.modes.lock().await.clone();
+        let own = self.own_workspaces.read().await.clone();
+        let overview = tokio::task::spawn_blocking(move || build_overview(&sync_root(), &modes, own.as_deref()))
+            .await
+            .unwrap_or_default();
+        *self.overview_cache.lock().await = Some((std::time::Instant::now(), overview.clone()));
+        overview
+    }
+
+    /// Apply the producer's choice for a folder. The pin state is set at once;
+    /// bringing bytes in ("always") or freeing them ("online only") runs in the
+    /// background and can take a while on a big folder.
+    pub async fn set_folder_mode(self: &Arc<Self>, folder: &str, mode: pins::Mode) -> Result<String, String> {
+        if !is_safe_rel_path(folder) {
+            return Err("That folder name cannot be used.".into());
+        }
+        let path = sync_root().join(folder);
+        if !path.is_dir() {
+            return Err("That folder is not in the sync folder.".into());
+        }
+        {
+            let mut m = self.modes.lock().await;
+            pins::set(&mut m, folder, mode);
+            pins::save(&m);
+        }
+        *self.overview_cache.lock().await = None;
+        if crate::cloudfiles::is_supported() {
+            if let Err(e) = crate::cloudfiles::set_pin(&path, mode.pin()) {
+                log::info!("[Pins] {folder}: {e}");
+            }
+        }
+        let name = folder.rsplit('/').next().unwrap_or(folder).to_string();
+        match mode {
+            pins::Mode::Always => {
+                let engine = Arc::clone(self);
+                tokio::spawn(async move {
+                    let (n, failed) = tokio::task::spawn_blocking(move || hydrate_tree(&path)).await.unwrap_or((0, 0));
+                    log::warn!("[Pins] brought {n} files onto this PC, {failed} failed");
+                    *engine.overview_cache.lock().await = None;
+                });
+                Ok(format!("{name} stays on this PC. Files that were online only are coming down now."))
+            }
+            pins::Mode::Online => {
+                let engine = Arc::clone(self);
+                let scope = folder.to_string();
+                tokio::spawn(async move {
+                    match free_up_space(Some(Arc::clone(&engine)), Some(&scope)).await {
+                        Ok((n, b)) => log::info!("[Pins] freed {n} files, {b} bytes in {scope}"),
+                        Err(e) => log::warn!("[Pins] freeing {scope}: {e}"),
+                    }
+                    *engine.overview_cache.lock().await = None;
+                });
+                Ok(format!("{name} is online only. Files that are backed up are being freed now; anything not yet uploaded stays."))
+            }
+            pins::Mode::WhenOpened => Ok(format!("{name}: files come down when you open them and stay until you free up space.")),
+        }
+    }
+
+    /// Where a Workspace file is on this PC: its place in the sync folder (a
+    /// placeholder is fine, Windows fetches the bytes when FL Studio reads it),
+    /// or a copy downloaded for dragging earlier.
+    pub async fn local_path_for(&self, ws_id: &str, file_id: &str, name: &str) -> Option<PathBuf> {
+        let root = sync_root();
+        let rel = {
+            let idx = self.index.lock().await;
+            idx.values()
+                .find(|e| e.remote_id.as_deref() == Some(file_id) && e.workspace_id.as_deref() == Some(ws_id))
+                .map(|e| e.rel_path.clone())
+        };
+        if let Some(rel) = rel {
+            let p = root.join(rel);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let cached = drag_cache_path(file_id, name);
+        cached.is_file().then_some(cached)
+    }
+
+    /// Download a file that is not in the sync folder, for dragging.
+    pub async fn cache_for_drag(&self, ws_id: &str, file_id: &str, name: &str) -> Result<PathBuf, String> {
+        let token = self.token.read().await.clone().ok_or("Sign in first.")?;
+        let dest = drag_cache_path(file_id, name);
+        let dir = dest.parent().ok_or("no folder")?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let tmp = dir.join(format!("{}download", crate::rules::TEMP_PREFIX));
+        stream_to_file(&token, ws_id, file_id, &tmp).await?;
+        std::fs::rename(&tmp, &dest).map_err(|e| e.to_string())?;
+        Ok(dest)
+    }
+
+    async fn index_put(&self, entry: SyncEntry) {
+        let mut idx = self.index.lock().await;
+        idx.insert(entry.rel_path.clone(), entry);
+        write_index(&idx);
+    }
+
+    /// Put Workspace's version of a file in its place on this PC. Streamed to a
+    /// temporary file beside it and moved over the old one at the end, so an
+    /// interrupted download never leaves half a project where the whole one
+    /// was, and a 2 GB recording never sits in memory (the old download read
+    /// the whole body into memory and wrote straight over the file).
+    async fn download_replace(&self, token: &str, ws_id: &str, file_id: &str, rel_path: &str) -> Result<SyncEntry, String> {
+        if !is_safe_rel_path(rel_path) {
+            return Err(format!("unsafe path {rel_path}"));
+        }
+        let dest = sync_root().join(rel_path);
+        // What is at the path now. If it changes while the download runs (FL
+        // Studio saved it), the download is thrown away instead of written
+        // over that save; the next pass sees both sides changed.
+        let stamp = |p: &Path| p.metadata().ok().map(|m| (m.len(), file_mtime(p)));
+        let before = stamp(&dest);
+        let dir = dest.parent().ok_or("no folder")?.to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        let name = dest.file_name().and_then(|n| n.to_str()).ok_or("bad file name")?;
+        let tmp = dir.join(format!("{}{}", crate::rules::TEMP_PREFIX, name));
+
+        self.emit_file_progress(rel_path, "download", 0);
+        let mut last_err = String::new();
+        for attempt in 0..3u32 {
+            match stream_to_file(token, ws_id, file_id, &tmp).await {
+                Ok((sha, size)) => {
+                    if stamp(&dest) != before {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(format!("{rel_path} changed on this PC during the download; left as it is"));
+                    }
+                    self.self_writes.lock().await.insert(rel_path.to_string(), sha.clone());
+                    if let Err(e) = std::fs::rename(&tmp, &dest) {
+                        let _ = std::fs::remove_file(&tmp);
+                        self.self_writes.lock().await.remove(rel_path);
+                        // Most often FL Studio holding the file open. Next pass.
+                        return Err(format!("replace {}: {e}", dest.display()));
+                    }
+                    self.emit_file_progress(rel_path, "download", 100);
+                    self.note("down", rel_path).await;
+                    return Ok(SyncEntry {
+                        rel_path: rel_path.to_string(),
+                        sha256: sha,
+                        modified: chrono::Utc::now().to_rfc3339(),
+                        size,
+                        remote_id: Some(file_id.to_string()),
+                        workspace_id: Some(ws_id.to_string()),
+                        mtime: file_mtime(&dest),
+                        verified: true,
+                    });
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    last_err = e;
+                    tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Start the sync loop. Call this once on app startup.
@@ -480,8 +779,10 @@ impl SyncEngine {
             match crate::cloudfiles::register(&root, "Hardwave Workspace") {
                 Ok(()) => {
                     let token = Arc::clone(&self.token);
-                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64| {
+                    let stale_trigger = Arc::clone(&self.sse_trigger);
+                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64, file_size: u64| {
                         let token = Arc::clone(&token);
+                        let stale_trigger = Arc::clone(&stale_trigger);
                         Box::pin(async move {
                             // identity is "workspaceId/fileId", set when the
                             // placeholder was created.
@@ -504,8 +805,34 @@ impl SyncEngine {
                                 .send().await
                                 .map_err(|e| format!("hydrate request failed: {e}"))?;
 
+                            // The placeholder describes one version of the file;
+                            // Workspace serves the newest. When the sizes differ
+                            // the file changed on another PC and this placeholder
+                            // is stale: serving the new bytes cut to the old size
+                            // gave a corrupt file (Windows test, 2026-10-09).
+                            // Refuse, so the opening program gets an error, and
+                            // run a sync pass, which refreshes the placeholder.
+                            let stale = |total: u64| -> Result<(), String> {
+                                if file_size > 0 && total != file_size {
+                                    stale_trigger.notify_one();
+                                    return Err(format!(
+                                        "{identity} changed in Workspace ({total} bytes now, {file_size} here); the placeholder is refreshed on the next pass"
+                                    ));
+                                }
+                                Ok(())
+                            };
                             let status = ranged.status();
                             if status.as_u16() == 206 {
+                                // "bytes 0-1023/52998": the number after / is the whole object.
+                                let total = ranged
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_RANGE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.rsplit('/').next())
+                                    .and_then(|v| v.trim().parse::<u64>().ok());
+                                if let Some(total) = total {
+                                    stale(total)?;
+                                }
                                 let b = ranged.bytes().await
                                     .map_err(|e| format!("hydrate body failed: {e}"))?;
                                 return Ok(b.to_vec());
@@ -517,6 +844,7 @@ impl SyncEngine {
                             // window Windows actually asked for.
                             let all = ranged.bytes().await
                                 .map_err(|e| format!("hydrate body failed: {e}"))?;
+                            stale(all.len() as u64)?;
                             let start = (offset as usize).min(all.len());
                             let stop = (start + length as usize).min(all.len());
                             Ok(all[start..stop].to_vec())
@@ -525,7 +853,7 @@ impl SyncEngine {
 
                     match crate::hydration::connect(&root, fetcher) {
                         Ok(conn) => {
-                            eprintln!("[Sync] Files On-Demand active at {}", root.display());
+                            log::info!("[Sync] Files On-Demand active at {}", root.display());
                             // The OS connection lives until CfDisconnectSyncRoot
                             // is called, which we never do while running. Park the
                             // handle rather than dropping it so a future clean
@@ -534,10 +862,10 @@ impl SyncEngine {
                                 std::sync::OnceLock::new();
                             let _ = HYDRATION.set(conn);
                         }
-                        Err(e) => eprintln!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
+                        Err(e) => log::warn!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
                     }
                 }
-                Err(e) => eprintln!("[Sync] sync-root registration failed: {e} — falling back to full downloads"),
+                Err(e) => log::warn!("[Sync] sync-root registration failed: {e} — falling back to full downloads"),
             }
         }
 
@@ -565,12 +893,12 @@ impl SyncEngine {
             }) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("[Sync] Failed to create file watcher: {}", e);
+                    log::warn!("[Sync] Failed to create file watcher: {}", e);
                     return;
                 }
             };
             if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                eprintln!("[Sync] Failed to start watching '{}': {}", root.display(), e);
+                log::warn!("[Sync] Failed to start watching '{}': {}", root.display(), e);
                 return;
             }
             // Keep the watcher alive
@@ -583,12 +911,15 @@ impl SyncEngine {
         let engine_fs = Arc::clone(&self);
         tokio::spawn(async move {
             while let Some(rel_path) = fs_rx.recv().await {
+                if crate::rules::is_excluded(&rel_path) {
+                    continue;
+                }
                 if *engine_fs.paused.read().await {
                     continue;
                 }
                 // Debounce: wait a bit for writes to finish
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let _ = engine_fs.sync_local_file(&rel_path).await;
+                let _ = engine_fs.sync_local_file(&rel_path, false).await;
             }
         });
 
@@ -600,7 +931,7 @@ impl SyncEngine {
                 tokio::select! {
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
                     _ = sse_trigger.notified() => {
-                        eprintln!("[Sync] SSE trigger: running immediate sync");
+                        log::info!("[Sync] SSE trigger: running immediate sync");
                     }
                 }
                 if *engine_poll.paused.read().await {
@@ -612,7 +943,10 @@ impl SyncEngine {
     }
 
     /// Sync a single local file change to remote.
-    async fn sync_local_file(&self, rel_path: &str) -> Result<(), String> {
+    /// Upload one changed local file. `force` is the producer's "keep this
+    /// PC's" from a conflict; without it a file Workspace moved on from since
+    /// the last sync becomes a conflict instead of being uploaded over.
+    async fn sync_local_file(&self, rel_path: &str, force: bool) -> Result<(), String> {
         let token = self.token.read().await.clone();
         let token = match token {
             Some(t) => t,
@@ -629,15 +963,67 @@ impl SyncEngine {
             return Ok(());
         }
 
+        if full_path.is_dir() || crate::rules::is_excluded(rel_path) {
+            return Ok(());
+        }
+        if !force && self.conflicts.lock().await.contains_key(rel_path) {
+            return Ok(());
+        }
+
         let meta = std::fs::metadata(&full_path).map_err(|e| e.to_string())?;
         let sha = hash_file(&full_path)?;
 
-        // Check hash against index (brief lock)
+        // A download the engine just wrote: not a local change.
         {
+            let mut writes = self.self_writes.lock().await;
+            if writes.get(rel_path) == Some(&sha) {
+                writes.remove(rel_path);
+                return Ok(());
+            }
+        }
+
+        // Check hash against index (brief lock)
+        let known = {
             let index = self.index.lock().await;
-            if let Some(entry) = index.get(rel_path) {
-                if entry.sha256 == sha {
-                    return Ok(());
+            match index.get(rel_path) {
+                Some(entry) if entry.sha256 == sha => return Ok(()),
+                Some(entry) => Some((entry.sha256.clone(), entry.remote_id.clone(), entry.workspace_id.clone())),
+                None => None,
+            }
+        };
+
+        // Another PC may have saved a newer version that this one has not
+        // pulled yet. Uploading now would bury it under this one. The check
+        // fails closed: when it cannot be made, nothing is uploaded and the
+        // next pass tries again (launch audit 2026-10-08).
+        if !force {
+            // A file this PC never synced may already exist in Workspace under
+            // the same path, as an old copy on a second PC does. Only the full
+            // pass, which holds the server's list, may decide that one.
+            if known.is_none() {
+                self.sse_trigger.notify_one();
+                return Ok(());
+            }
+            if let Some((entry_sha, Some(remote_id), Some(ws_id))) = &known {
+                let state = api::file_state(&token, ws_id, remote_id).await?;
+                if let Some(remote) = state {
+                    let remote_sha = remote.sha256.clone();
+                    if remote_sha.as_deref() != Some(sha.as_str())
+                        && !conflicts::may_upload(Some(entry_sha), Some(remote_sha.as_deref()))
+                    {
+                        self.add_conflict(Conflict {
+                            rel_path: rel_path.to_string(),
+                            workspace_id: ws_id.clone(),
+                            remote_id: remote_id.clone(),
+                            local_size: meta.len(),
+                            local_mtime: file_mtime(&full_path),
+                            remote_size: remote.size,
+                            remote_sha: remote_sha.unwrap_or_default(),
+                            remote_updated_at: remote.updated_at.clone(),
+                            detected_at: chrono::Utc::now().to_rfc3339(),
+                        }).await;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -694,6 +1080,7 @@ impl SyncEngine {
         }, 2).await?;
 
         self.emit_file_progress(rel_path, "upload", 100);
+        self.note("up", rel_path).await;
 
         // Update index (brief lock)
         {
@@ -719,7 +1106,7 @@ impl SyncEngine {
     async fn full_sync(&self) -> Result<(), String> {
         // Prevent overlapping sync cycles
         if self.sync_active.swap(true, Ordering::SeqCst) {
-            eprintln!("[Sync] Full sync already in progress, skipping");
+            log::info!("[Sync] Full sync already in progress, skipping");
             return Ok(());
         }
         let _guard = SyncGuard(&self.sync_active);
@@ -752,11 +1139,18 @@ impl SyncEngine {
     async fn do_full_sync(&self, token: &str) -> Result<(), String> {
         let root = sync_root();
         let workspaces = api::list_workspaces(token).await?;
-        eprintln!("[Sync] Full sync: {} workspace(s)", workspaces.len());
+        log::info!("[Sync] Full sync: {} workspace(s)", workspaces.len());
+        let own: Vec<String> = workspaces.iter().filter(|w| is_safe_component(&w.name)).map(|w| w.name.clone()).collect();
+        let changed = self.own_workspaces.read().await.as_ref() != Some(&own);
+        if changed {
+            *self.own_workspaces.write().await = Some(own);
+            *self.disk_cache.write().await = None;
+            *self.overview_cache.lock().await = None;
+        }
 
         for ws in &workspaces {
             if !is_safe_component(&ws.name) {
-                eprintln!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
+                log::info!("[Sync] Skipping workspace with unsafe name: {}", ws.name);
                 continue;
             }
             let ws_dir = root.join(&ws.name);
@@ -775,31 +1169,72 @@ impl SyncEngine {
 
             let remote_files = match api::list_files(token, &ws.id).await {
                 Ok(f) => {
-                    eprintln!("[Sync] Workspace '{}': {} remote file(s)", ws.name, f.len());
+                    log::info!("[Sync] Workspace '{}': {} remote file(s)", ws.name, f.len());
                     f
                 }
                 Err(e) => {
-                    eprintln!("[Sync] Failed to list files for '{}': {}", ws.name, e);
+                    log::warn!("[Sync] Failed to list files for '{}': {}", ws.name, e);
                     continue;
                 }
             };
 
             // ── Download phase ─────────────────────────────────────
             // Determine what needs downloading (index lock held briefly)
-            let to_download: Vec<(String, api::WorkspaceFile)> = {
+            // Each candidate carries what the index remembers about it (sha,
+            // size, mtime), so the decision below needs no lock. The checksum
+            // of every remote file by path is kept for the upload scan.
+            type Remembered = Option<(String, u64, Option<i64>)>;
+            let mut remote_sha_by_rel: HashMap<String, Option<String>> = HashMap::new();
+            let rel_of = |rf: &api::WorkspaceFile| {
+                let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
+                if folder.is_empty() {
+                    format!("{}/{}", ws.name, rf.name)
+                } else {
+                    format!("{}/{}/{}", ws.name, folder, rf.name)
+                }
+            };
+            // Several server rows can land on one path here: folders whose
+            // stored path is wrong (635 in production on 2026-10-08) and names
+            // that differ only in case, which Windows treats as one file.
+            // Deciding each row separately replaced the file with the other row
+            // on alternate passes. The newest row wins; the others are left
+            // alone. A path that would leave the sync folder is never used.
+            let mut newest_by_path: HashMap<String, usize> = HashMap::new();
+            let (mut unsafe_paths, mut collapsed) = (0usize, 0usize);
+            for (i, rf) in remote_files.iter().enumerate() {
+                let rel = rel_of(rf);
+                if !is_safe_rel_path(&rel) {
+                    unsafe_paths += 1;
+                    continue;
+                }
+                let key = rel.to_lowercase();
+                match newest_by_path.get(&key) {
+                    Some(&j) if remote_files[j].updated_at >= rf.updated_at => collapsed += 1,
+                    Some(_) => {
+                        collapsed += 1;
+                        newest_by_path.insert(key, i);
+                    }
+                    None => {
+                        newest_by_path.insert(key, i);
+                    }
+                }
+            }
+            if unsafe_paths + collapsed > 0 {
+                log::info!("[Sync] '{}': {} unsafe path(s) skipped, {} duplicate path(s) folded into the newest", ws.name, unsafe_paths, collapsed);
+            }
+            let mut chosen: Vec<usize> = newest_by_path.into_values().collect();
+            chosen.sort_unstable();
+            let to_download: Vec<(String, api::WorkspaceFile, Remembered)> = {
                 let idx = self.index.lock().await;
-                remote_files.iter().filter_map(|rf| {
-                    let folder = rf.folder_path.as_deref().unwrap_or("/").trim_matches('/');
-                    let rel_path = if folder.is_empty() {
-                        format!("{}/{}", ws.name, rf.name)
-                    } else {
-                        format!("{}/{}/{}", ws.name, folder, rf.name)
-                    };
-                    let should = match idx.get(&rel_path) {
-                        Some(e) => rf.sha256.as_deref() != Some(&e.sha256),
+                chosen.iter().map(|&i| &remote_files[i]).filter_map(|rf| {
+                    let rel_path = rel_of(rf);
+                    remote_sha_by_rel.insert(rel_path.clone(), rf.sha256.clone().filter(|h| !h.is_empty()));
+                    let entry = idx.get(&rel_path);
+                    let should = match entry {
+                        Some(e) => rf.sha256.as_deref().is_some_and(|h| !h.is_empty() && h != e.sha256),
                         None => true,
                     };
-                    should.then(|| (rel_path, rf.clone()))
+                    should.then(|| (rel_path, rf.clone(), entry.map(|e| (e.sha256.clone(), e.size, e.mtime))))
                 }).collect()
             };
 
@@ -815,7 +1250,7 @@ impl SyncEngine {
             const INDEX_FLUSH_EVERY: usize = 200;
             let mut downloaded: Vec<SyncEntry> = Vec::new();
             let mut pending_flush: Vec<SyncEntry> = Vec::new();
-            for (rel_path, rf) in &to_download {
+            for (rel_path, rf, remembered) in &to_download {
                 if pending_flush.len() >= INDEX_FLUSH_EVERY {
                     let mut idx = self.index.lock().await;
                     for e in pending_flush.drain(..) {
@@ -825,40 +1260,121 @@ impl SyncEngine {
                 }
                 let local_path = root.join(rel_path);
 
-                // The file exists locally but is not indexed yet. Matched from
-                // metadata, never by hashing here (see trust_without_hash):
-                // hashing was the hour-long first pass, and it hydrated any
-                // cloud-only placeholder it read. A file that does not qualify
-                // stays unindexed; the upload scan hashes it once, and the
-                // server recognises identical bytes without a transfer.
-                if local_path.exists() {
-                    let local_size = local_path.metadata().map(|m| m.len()).unwrap_or(0);
-                    let local_mtime = file_mtime(&local_path);
-                    if trust_without_hash(
-                        local_size,
-                        local_mtime,
+                // Waiting on the producer's choice: leave both sides alone.
+                if self.conflicts.lock().await.contains_key(rel_path.as_str()) {
+                    continue;
+                }
+
+                // What is on this PC, the last synced version and Workspace's
+                // decide together (conflicts.rs). Matching by size and time
+                // comes first and hashing only when that cannot tell: hashing
+                // was the hour-long first pass, and it hydrated any cloud-only
+                // placeholder it read.
+                let local = if !local_path.exists() {
+                    Local::Missing
+                } else if crate::cloudfiles::is_placeholder(&local_path) {
+                    Local::Placeholder
+                } else {
+                    Local::File {
+                        size: local_path.metadata().map(|m| m.len()).unwrap_or(0),
+                        mtime: file_mtime(&local_path),
+                    }
+                };
+                let indexed = remembered.as_ref().map(|(sha, size, mtime)| Indexed { sha, size: *size, mtime: *mtime });
+                let trusted = match local {
+                    Local::File { size, mtime } => trust_without_hash(
+                        size,
+                        mtime,
                         rf.size,
                         rf.sha256.as_deref(),
                         rf.created_at.as_deref(),
-                    ) {
+                    ),
+                    _ => false,
+                };
+                let mut action = conflicts::plan_remote(indexed, local, rf.sha256.as_deref(), rf.size, trusted);
+                let mut hashed = false;
+                if action == RemoteAction::NeedsHash {
+                    action = match hash_file(&local_path) {
+                        Ok(h) => {
+                            hashed = true;
+                            conflicts::after_hash(indexed, &h, rf.sha256.as_deref())
+                        }
+                        // Unreadable, open in FL Studio say: try again next pass.
+                        Err(_) => RemoteAction::Skip,
+                    };
+                }
+
+                match action {
+                    RemoteAction::Skip | RemoteAction::NeedsHash => continue,
+                    RemoteAction::Index => {
+                        let Local::File { size, mtime } = local else { continue };
                         let entry = SyncEntry {
                             rel_path: rel_path.clone(),
                             sha256: rf.sha256.clone().unwrap_or_default(),
                             modified: chrono::Utc::now().to_rfc3339(),
-                            size: local_size,
+                            size,
                             remote_id: Some(rf.id.clone()),
                             workspace_id: Some(ws.id.clone()),
-                            mtime: local_mtime,
-                            verified: false,
+                            mtime,
+                            // Matched from metadata alone: Free Up Space hashes it first.
+                            verified: hashed,
                         };
                         pending_flush.push(entry.clone());
                         downloaded.push(entry);
                         continue;
                     }
-                    if local_size != rf.size {
-                        self.emit_conflict(rel_path, local_size, rf.size);
+                    RemoteAction::Conflict => {
+                        let Local::File { size, mtime } = local else { continue };
+                        self.add_conflict(Conflict {
+                            rel_path: rel_path.clone(),
+                            workspace_id: ws.id.clone(),
+                            remote_id: rf.id.clone(),
+                            local_size: size,
+                            local_mtime: mtime,
+                            remote_size: rf.size,
+                            remote_sha: rf.sha256.clone().unwrap_or_default(),
+                            remote_updated_at: rf.updated_at.clone(),
+                            detected_at: chrono::Utc::now().to_rfc3339(),
+                        }).await;
+                        continue;
                     }
-                    continue;
+                    RemoteAction::RefreshPlaceholder => {
+                        let identity = format!("{}/{}", ws.id, rf.id);
+                        match crate::cloudfiles::refresh_placeholder(&root, rel_path, rf.size, &identity) {
+                            Ok(()) => {
+                                let entry = SyncEntry {
+                                    rel_path: rel_path.clone(),
+                                    sha256: rf.sha256.clone().unwrap_or_default(),
+                                    modified: chrono::Utc::now().to_rfc3339(),
+                                    size: rf.size,
+                                    remote_id: Some(rf.id.clone()),
+                                    workspace_id: Some(ws.id.clone()),
+                                    mtime: file_mtime(&local_path),
+                                    verified: true,
+                                };
+                                pending_flush.push(entry.clone());
+                                downloaded.push(entry);
+                                self.emit_file_progress(rel_path, "placeholder", 100);
+                            }
+                            Err(e) => log::warn!("[Sync] Placeholder refresh failed for '{}': {}", rel_path, e),
+                        }
+                        continue;
+                    }
+                    RemoteAction::Fetch => {
+                        // Untouched here and newer in Workspace: replace it whole,
+                        // so a file that lived on this PC stays on this PC.
+                        if let Local::File { .. } = local {
+                            match self.download_replace(token, &ws.id, &rf.id, rel_path).await {
+                                Ok(entry) => {
+                                    pending_flush.push(entry.clone());
+                                    downloaded.push(entry);
+                                }
+                                Err(e) => log::warn!("[Sync] Update failed for '{}': {}", rel_path, e),
+                            }
+                            continue;
+                        }
+                        // Not here yet: a placeholder or a download, below.
+                    }
                 }
 
                 if let Some(parent) = local_path.parent() {
@@ -870,7 +1386,9 @@ impl SyncEngine {
                 // disk, and Windows calls our hydration handler if anything
                 // actually opens it. Falls through to a real download when the
                 // platform does not support it (non-Windows, or pre-1709).
-                if crate::cloudfiles::is_supported() {
+                // A folder kept "always on this PC" gets the bytes, not a placeholder.
+                let always = pins::mode_for(rel_path, &*self.modes.lock().await) == pins::Mode::Always;
+                if crate::cloudfiles::is_supported() && !always {
                     let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                     let ph = crate::cloudfiles::RemoteFile {
                         rel_path: rel_path.clone(),
@@ -879,7 +1397,7 @@ impl SyncEngine {
                     };
                     match crate::cloudfiles::create_placeholders(&root, dir, &[ph]) {
                         Ok(n) if n > 0 => {
-                            eprintln!("[Sync] Placeholder: {}", rel_path);
+                            log::info!("[Sync] Placeholder: {}", rel_path);
                             let entry = SyncEntry {
                                 rel_path: rel_path.clone(),
                                 // The remote hash is authoritative until the
@@ -900,60 +1418,15 @@ impl SyncEngine {
                             self.emit_file_progress(rel_path, "placeholder", 100);
                             continue;
                         }
-                        Ok(_) => eprintln!("[Sync] Placeholder skipped for '{}'", rel_path),
-                        Err(e) => eprintln!("[Sync] Placeholder failed for '{}': {} — downloading instead", rel_path, e),
+                        Ok(_) => log::info!("[Sync] Placeholder skipped for '{}'", rel_path),
+                        Err(e) => log::warn!("[Sync] Placeholder failed for '{}': {} — downloading instead", rel_path, e),
                     }
                 }
 
-                eprintln!("[Sync] Downloading: {}", rel_path);
-                self.emit_file_progress(rel_path, "download", 0);
-                // Download with retry
-                let dl = api::with_retry({
-                    let token = token.to_string();
-                    let ws_id = ws.id.clone();
-                    let rf_id = rf.id.clone();
-                    let rel_path = rel_path.clone();
-                    move || {
-                        let token = token.clone();
-                        let ws_id = ws_id.clone();
-                        let rf_id = rf_id.clone();
-                        let rel_path = rel_path.clone();
-                        Box::pin(async move {
-                            let url = api::get_download_url(&token, &ws_id, &rf_id).await?;
-                            let bytes = api::http_client().get(&url).send().await
-                                .map_err(|e| format!("Download failed: {}", e))?
-                                .bytes().await
-                                .map_err(|e| format!("Read body failed: {}", e))?;
-                            let sha = {
-                                let mut h = Sha256::new();
-                                h.update(&bytes);
-                                hex::encode(h.finalize())
-                            };
-                            let local_path = sync_root().join(&rel_path);
-                            std::fs::write(&local_path, &bytes)
-                                .map_err(|e| format!("Write failed: {}", e))?;
-                            Ok((sha, bytes.len() as u64))
-                        })
-                    }
-                }, 2).await;
-
-                match dl {
-                    Ok((sha, size)) => {
-                        downloaded.push(SyncEntry {
-                            rel_path: rel_path.clone(),
-                            sha256: sha,
-                            modified: chrono::Utc::now().to_rfc3339(),
-                            size,
-                            remote_id: Some(rf.id.clone()),
-                            workspace_id: Some(ws.id.clone()),
-                            mtime: file_mtime(&root.join(rel_path.as_str())),
-                            verified: true,
-                        });
-                        self.emit_file_progress(rel_path, "download", 100);
-                    }
-                    Err(e) => {
-                        log::warn!("[Sync] Download failed for '{}': {}", rel_path, e);
-                    }
+                log::info!("[Sync] Downloading: {}", rel_path);
+                match self.download_replace(token, &ws.id, &rf.id, rel_path).await {
+                    Ok(entry) => downloaded.push(entry),
+                    Err(e) => log::warn!("[Sync] Download failed for '{}': {}", rel_path, e),
                 }
             }
 
@@ -988,9 +1461,20 @@ impl SyncEngine {
             // only when we already had to hash to confirm a real edit.
             let mut to_upload: Vec<(String, PathBuf, u64, Option<String>)> = Vec::new();
             let mut backfill_mtime: Vec<(String, i64)> = Vec::new();
+            let waiting: std::collections::HashSet<String> = self.conflicts.lock().await.keys().cloned().collect();
             for (local_rel, local_path, size) in &local_files {
                 let full_rel = format!("{}/{}", ws.name, local_rel);
                 let indexed = idx_snapshot.get(&full_rel);
+                // A conflict waits for the producer; and a file Workspace moved
+                // on from since the last sync is the download side's call.
+                if waiting.contains(&full_rel)
+                    || !conflicts::may_upload(
+                        indexed.map(|e| e.1.as_str()),
+                        remote_sha_by_rel.get(&full_rel).map(|o| o.as_deref()),
+                    )
+                {
+                    continue;
+                }
                 let mtime = file_mtime(local_path);
                 let uploaded = indexed.map(|e| e.3).unwrap_or(false);
                 match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), uploaded, *size, mtime) {
@@ -1015,7 +1499,7 @@ impl SyncEngine {
                             }
                         }
                         Ok(h) => {
-                            eprintln!("[Sync] Modified, re-uploading: {}", full_rel);
+                            log::info!("[Sync] Modified, re-uploading: {}", full_rel);
                             to_upload.push((full_rel, local_path.clone(), *size, Some(h)));
                         }
                         // Unreadable (locked by the DAW, say). Leave for next pass.
@@ -1116,6 +1600,7 @@ impl SyncEngine {
                 match result {
                     Ok((full_rel, sha, size, file_id, ws_id, entry_mtime)) => {
                         pass_ok += 1;
+                        self.note("up", &full_rel).await;
                         pending_entries.push(SyncEntry {
                             rel_path: full_rel,
                             sha256: sha,
@@ -1129,7 +1614,7 @@ impl SyncEngine {
                     }
                     Err(e) => {
                         pass_failed += 1;
-                        eprintln!("[Sync] Upload failed: {}", e);
+                        log::warn!("[Sync] Upload failed: {}", e);
                     }
                 }
 
@@ -1158,7 +1643,7 @@ impl SyncEngine {
                 let _ = self.app.emit("sync:status", self.get_status().await);
             }
             if uploaded_count > 0 {
-                eprintln!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
+                log::info!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
             }
 
             // Follow the line. Most uploads failing means the path to storage is
@@ -1176,7 +1661,7 @@ impl SyncEngine {
                     width
                 };
                 if next != width {
-                    eprintln!(
+                    log::info!(
                         "[Sync] {}/{} uploads failed in '{}': {} at a time -> {}",
                         pass_failed, tried, ws.name, width, next
                     );
@@ -1212,21 +1697,21 @@ impl SyncEngine {
 
             let mut backoff_ms = 2_000u64;
             loop {
-                eprintln!("[SSE] Connecting to workspace {}", workspace_id);
+                log::info!("[SSE] Connecting to workspace {}", workspace_id);
                 match sse_client.get(&url).bearer_auth(&token).send().await {
                     Err(e) => {
-                        eprintln!("[SSE] Connect error: {}", redact_token(&e.to_string()));
+                        log::warn!("[SSE] Connect error: {}", redact_token(&e.to_string()));
                     }
                     Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                         || resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                        eprintln!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
+                        log::warn!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
                         return; // 401/403: the token is gone, retrying will not help
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         // Maintenance (503) or a server error: keep trying with backoff.
                         // This used to stop the stream for good, so live updates only
                         // came back after the app was restarted.
-                        eprintln!("[SSE] Server answered {} for workspace {}; retrying", resp.status(), workspace_id);
+                        log::info!("[SSE] Server answered {} for workspace {}; retrying", resp.status(), workspace_id);
                     }
                     Ok(resp) => {
                         backoff_ms = 2_000; // reset on successful connect
@@ -1244,7 +1729,7 @@ impl SyncEngine {
                                         if let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) {
                                             let kind = ev["type"].as_str().unwrap_or("");
                                             if kind == "ping" { continue; }
-                                            eprintln!("[SSE] Event: {}", kind);
+                                            log::info!("[SSE] Event: {}", kind);
                                             // Trigger immediate sync if not already running
                                             if !*paused_arc.read().await
                                                 && !sync_flag.swap(true, Ordering::SeqCst)
@@ -1264,7 +1749,7 @@ impl SyncEngine {
                                 }
                             }
                         }
-                        eprintln!("[SSE] Stream ended for workspace {}", workspace_id);
+                        log::info!("[SSE] Stream ended for workspace {}", workspace_id);
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
@@ -1323,7 +1808,7 @@ async fn reconcile_from_server(
         let files = match crate::api::list_files(&token, &ws.id).await {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[FreeSpace] list '{}': {e}", ws.name);
+                log::info!("[FreeSpace] list '{}': {e}", ws.name);
                 continue;
             }
         };
@@ -1394,6 +1879,171 @@ async fn reconcile_from_server(
 ///
 /// Logs get pasted into bug reports and support mail. A login token in one is a working key to
 /// somebody's account for as long as it lives.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct FolderRow {
+    /// Relative to the sync root, `/` separators.
+    pub folder: String,
+    pub name: String,
+    /// 0 for a workspace, 1 for a folder in it.
+    pub depth: u8,
+    pub files: u64,
+    pub bytes_here: u64,
+    pub bytes_online: u64,
+    pub mode: Option<pins::Mode>,
+    /// The mode that applies, set here or on the workspace above.
+    pub effective: Option<pins::Mode>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct FolderOverview {
+    pub rows: Vec<FolderRow>,
+    pub bytes_here: u64,
+    pub bytes_online: u64,
+}
+
+/// Walk the sync root once: a placeholder counts as online only (its size is
+/// what Explorer shows), every other file as here.
+fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<&[String]>) -> FolderOverview {
+    fn skip(name: &str) -> bool {
+        name.starts_with('.') || crate::rules::is_excluded(name)
+    }
+    fn count(p: &Path, files: &mut u64, here: &mut u64, online: &mut u64) {
+        if let Ok(m) = p.metadata() {
+            *files += 1;
+            if crate::cloudfiles::is_placeholder(p) {
+                *online += m.len();
+            } else {
+                *here += m.len();
+            }
+        }
+    }
+    fn walk(dir: &Path, files: &mut u64, here: &mut u64, online: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if skip(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, files, here, online);
+            } else {
+                count(&p, files, here, online);
+            }
+        }
+    }
+    let row = |folder: String, name: String, depth: u8| FolderRow {
+        mode: modes.get(&folder).copied(),
+        effective: Some(pins::mode_for(&folder, modes)),
+        folder,
+        name,
+        depth,
+        files: 0,
+        bytes_here: 0,
+        bytes_online: 0,
+    };
+    let mut out = FolderOverview::default();
+    let Ok(workspaces) = std::fs::read_dir(root) else { return out };
+    let mut ws_dirs: Vec<PathBuf> = workspaces.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    ws_dirs.sort();
+    for ws in ws_dirs {
+        let ws_name = ws.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if ws_name.starts_with('.') || own.is_some_and(|o| !o.contains(&ws_name)) {
+            continue;
+        }
+        // Each file is read once: a workspace's totals are its loose files plus
+        // its folders' totals. Walking the workspace and then each folder again
+        // doubled the work, and a sync folder can hold hundreds of GB.
+        let mut ws_row = row(ws_name.clone(), ws_name.clone(), 0);
+        let mut subs: Vec<PathBuf> = Vec::new();
+        for e in std::fs::read_dir(&ws).map(|r| r.flatten().collect::<Vec<_>>()).unwrap_or_default() {
+            let p = e.path();
+            if skip(&e.file_name().to_string_lossy()) {
+                continue;
+            }
+            if p.is_dir() {
+                subs.push(p);
+            } else {
+                count(&p, &mut ws_row.files, &mut ws_row.bytes_here, &mut ws_row.bytes_online);
+            }
+        }
+        subs.sort();
+        let mut sub_rows = Vec::with_capacity(subs.len());
+        for sub in subs {
+            let name = sub.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let mut r = row(format!("{ws_name}/{name}"), name, 1);
+            walk(&sub, &mut r.files, &mut r.bytes_here, &mut r.bytes_online);
+            ws_row.files += r.files;
+            ws_row.bytes_here += r.bytes_here;
+            ws_row.bytes_online += r.bytes_online;
+            sub_rows.push(r);
+        }
+        out.bytes_here += ws_row.bytes_here;
+        out.bytes_online += ws_row.bytes_online;
+        out.rows.push(ws_row);
+        out.rows.extend(sub_rows);
+    }
+    out
+}
+
+/// Bring every cloud-only file under `dir` onto this PC. Returns (done, failed).
+fn hydrate_tree(dir: &Path) -> (u32, u32) {
+    let (mut done, mut failed) = (0u32, 0u32);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if crate::cloudfiles::is_placeholder(&p) {
+                match crate::cloudfiles::hydrate(&p) {
+                    Ok(()) => done += 1,
+                    Err(err) => {
+                        failed += 1;
+                        log::warn!("[Pins] {}: {err}", p.display());
+                    }
+                }
+            }
+        }
+    }
+    (done, failed)
+}
+
+/// Copies of files dragged out of the window that were not in the sync folder.
+fn drag_cache_path(file_id: &str, name: &str) -> PathBuf {
+    let safe_id: String = file_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let safe_name: String = name.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("hardwave")
+        .join("drag")
+        .join(safe_id)
+        .join(if safe_name.trim().is_empty() { "sound".to_string() } else { safe_name })
+}
+
+/// Stream one file from Workspace to `path`, hashing on the way.
+async fn stream_to_file(token: &str, ws_id: &str, file_id: &str, path: &Path) -> Result<(String, u64), String> {
+    use tokio::io::AsyncWriteExt;
+    let url = api::get_download_url(token, ws_id, file_id).await?;
+    let res = api::http_client().get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("Download failed: {}", res.status()));
+    }
+    let mut file = tokio::fs::File::create(path).await.map_err(|e| format!("Write failed: {}", e))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut body = res.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|e| format!("Read body failed: {}", e))?;
+        hasher.update(&chunk);
+        size += chunk.len() as u64;
+        file.write_all(&chunk).await.map_err(|e| format!("Write failed: {}", e))?;
+    }
+    file.flush().await.map_err(|e| format!("Write failed: {}", e))?;
+    file.sync_all().await.map_err(|e| format!("Write failed: {}", e))?;
+    Ok((hex::encode(hasher.finalize()), size))
+}
+
 pub fn redact_token(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -1439,13 +2089,27 @@ const FREE_SPACE_PARALLEL: usize = 4;
 ///
 /// Hashing happens here, per file, right before freeing it, several files at a
 /// time, instead of up front in the sync pass.
-pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64), String> {
+pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>) -> Result<(u32, u64), String> {
     use futures_util::stream::{self, StreamExt};
 
     if !crate::cloudfiles::is_supported() {
         return Err("Files On-Demand is not available on this system".into());
     }
     let root = sync_root();
+
+    // Only the given folder when there is one, and never a folder the producer
+    // keeps "always on this PC".
+    let modes = match &engine {
+        Some(e) => e.modes.lock().await.clone(),
+        None => pins::load(),
+    };
+    let in_scope = |rel: &str| -> bool {
+        let inside = match scope {
+            Some(f) => rel.len() > f.len() && rel.starts_with(f) && rel.as_bytes()[f.len()] == b'/',
+            None => true,
+        };
+        inside && pins::mode_for(rel, &modes) != pins::Mode::Always
+    };
 
     // Work from the running engine's index when there is one. Reading and
     // writing the file on disk behind its back let the engine's next flush
@@ -1465,7 +2129,7 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
     if let Some(engine) = &engine {
         match reconcile_from_server(engine, &root, &index).await {
             Ok((trusted, to_hash)) => {
-                eprintln!(
+                log::info!(
                     "[FreeSpace] matched {} files by metadata, {} more need a hash",
                     trusted.len(),
                     to_hash.len()
@@ -1477,12 +2141,16 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
                 candidates.extend(to_hash);
             }
             // Only ever adds candidates; the index alone is still usable.
-            Err(e) => eprintln!("[FreeSpace] could not reach the server ({e}); using the local index only"),
+            Err(e) => log::warn!("[FreeSpace] could not reach the server ({e}); using the local index only"),
         }
     }
 
+    candidates.retain(|c| in_scope(&c.rel_path));
     let mut skipped = 0u32;
     for (rel_path, entry) in index.iter() {
+        if !in_scope(rel_path) {
+            continue;
+        }
         let path = root.join(rel_path);
         // Already dehydrated: nothing to reclaim.
         if !path.is_file() || crate::cloudfiles::is_placeholder(&path) {
@@ -1567,7 +2235,7 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
             }
             Ok(false) => skipped += 1,
             Err(e) => {
-                eprintln!("[FreeSpace] {}: {e}", c.rel_path);
+                log::info!("[FreeSpace] {}: {e}", c.rel_path);
                 skipped += 1;
             }
         }
@@ -1591,7 +2259,7 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>) -> Result<(u32, u64)
         }
     }
 
-    eprintln!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
+    log::info!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
     Ok((freed_files, freed_bytes))
 }
 
@@ -1780,7 +2448,7 @@ pub async fn archive_folder(
     prune_empty_dirs(&src);
     report.folder_removed = !src.exists();
 
-    eprintln!(
+    log::info!(
         "[Archive] {} files moved to '{}', {} bytes freed, {} skipped",
         report.moved, report.workspace, report.bytes_freed, report.skipped
     );
@@ -1884,6 +2552,24 @@ mod redact_token_tests {
     use super::redact_token;
 
     #[test]
+    fn paths_from_the_server_never_leave_the_sync_folder() {
+        assert!(super::is_safe_rel_path("Studio/FL Studio/Face Of Fire.flp"));
+        assert!(super::is_safe_rel_path("Studio/a..b.wav"));
+        for bad in [
+            "Studio/../../AppData/x.bat",
+            "Studio/..\\..\\Startup\\x.bat",
+            "C:/Windows/x.dll",
+            "Studio/C:x.bat",
+            "/etc/passwd",
+            "Studio//x.wav",
+            "Studio/./x.wav",
+            "",
+        ] {
+            assert!(!super::is_safe_rel_path(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn takes_the_token_out_of_a_url() {
         let line = "error sending request for url (https://workspace.hardwavestudios.com/api/workspaces/2/events?token=eyJhbGciOiJIUzI1NiJ9.abc-DEF_123.sig)";
         let out = redact_token(line);
@@ -1895,5 +2581,34 @@ mod redact_token_tests {
     #[test]
     fn leaves_ordinary_text_alone() {
         assert_eq!(redact_token("nothing to hide here"), "nothing to hide here");
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    #[test]
+    fn the_folder_list_counts_each_file_once_and_only_this_accounts_workspaces() {
+        let root = std::env::temp_dir().join(format!("hw-overview-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Mine/Kicks")).unwrap();
+        std::fs::create_dir_all(root.join("Someone else/Leads")).unwrap();
+        std::fs::write(root.join("Mine/loose.txt"), b"12345").unwrap();
+        std::fs::write(root.join("Mine/Kicks/kick.wav"), b"1234567890").unwrap();
+        std::fs::write(root.join("Someone else/Leads/lead.wav"), b"123").unwrap();
+
+        let own = vec!["Mine".to_string()];
+        let o = build_overview(&root, &HashMap::new(), Some(&own));
+        let names: Vec<&str> = o.rows.iter().map(|r| r.folder.as_str()).collect();
+        assert_eq!(names, ["Mine", "Mine/Kicks"]);
+        assert_eq!((o.rows[0].files, o.rows[0].bytes_here), (2, 15));
+        assert_eq!((o.rows[1].files, o.rows[1].bytes_here), (1, 10));
+        assert_eq!(o.bytes_here, 15);
+
+        // Before the first pass has listed the workspaces, every folder shows.
+        let all = build_overview(&root, &HashMap::new(), None);
+        assert_eq!(all.rows.len(), 4);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

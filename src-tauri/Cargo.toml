@@ -1,6 +1,6 @@
 [package]
 name = "hardwave-workspace"
-version = "0.2.20"
+version = "0.2.21"
 edition = "2021"
 
 [lib]
@@ -26,6 +26,8 @@ sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# Send a replaced copy to the Recycle Bin when a conflict is settled.
+trash = "5"
 
 # Files On-Demand (Windows only). Placeholders that appear full-size in Explorer
 # but hold no data until something reads them. Proven to work unpackaged and
@@ -46,6 +48,8 @@ windows = { version = "0.58", features = [
   # AttachConsole, so `--free-up-space` can print into the shell that started it.
   "Win32_System_Console",
 ] }
+# Drag a sound from the window straight into FL Studio (Sounds page).
+drag = "2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
@@ -54,3 +58,5 @@ tauri-plugin-dialog = "2"
 # Stops a second copy running: two instances each draw their own tray icon,
 # and only one of them owns the sync root.
 tauri-plugin-single-instance = "2"
+# "Start with Windows" on the This PC page; starts in the tray with --minimized.
+tauri-plugin-autostart = "2"
