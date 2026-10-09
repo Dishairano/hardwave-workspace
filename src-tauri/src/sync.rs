@@ -767,8 +767,10 @@ impl SyncEngine {
             match crate::cloudfiles::register(&root, "Hardwave Workspace") {
                 Ok(()) => {
                     let token = Arc::clone(&self.token);
-                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64| {
+                    let stale_trigger = Arc::clone(&self.sse_trigger);
+                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64, file_size: u64| {
                         let token = Arc::clone(&token);
+                        let stale_trigger = Arc::clone(&stale_trigger);
                         Box::pin(async move {
                             // identity is "workspaceId/fileId", set when the
                             // placeholder was created.
@@ -791,8 +793,34 @@ impl SyncEngine {
                                 .send().await
                                 .map_err(|e| format!("hydrate request failed: {e}"))?;
 
+                            // The placeholder describes one version of the file;
+                            // Workspace serves the newest. When the sizes differ
+                            // the file changed on another PC and this placeholder
+                            // is stale: serving the new bytes cut to the old size
+                            // gave a corrupt file (Windows test, 2026-10-09).
+                            // Refuse, so the opening program gets an error, and
+                            // run a sync pass, which refreshes the placeholder.
+                            let stale = |total: u64| -> Result<(), String> {
+                                if file_size > 0 && total != file_size {
+                                    stale_trigger.notify_one();
+                                    return Err(format!(
+                                        "{identity} changed in Workspace ({total} bytes now, {file_size} here); the placeholder is refreshed on the next pass"
+                                    ));
+                                }
+                                Ok(())
+                            };
                             let status = ranged.status();
                             if status.as_u16() == 206 {
+                                // "bytes 0-1023/52998": the number after / is the whole object.
+                                let total = ranged
+                                    .headers()
+                                    .get(reqwest::header::CONTENT_RANGE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|v| v.rsplit('/').next())
+                                    .and_then(|v| v.trim().parse::<u64>().ok());
+                                if let Some(total) = total {
+                                    stale(total)?;
+                                }
                                 let b = ranged.bytes().await
                                     .map_err(|e| format!("hydrate body failed: {e}"))?;
                                 return Ok(b.to_vec());
@@ -804,6 +832,7 @@ impl SyncEngine {
                             // window Windows actually asked for.
                             let all = ranged.bytes().await
                                 .map_err(|e| format!("hydrate body failed: {e}"))?;
+                            stale(all.len() as u64)?;
                             let start = (offset as usize).min(all.len());
                             let stop = (start + length as usize).min(all.len());
                             Ok(all[start..stop].to_vec())

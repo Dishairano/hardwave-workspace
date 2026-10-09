@@ -103,7 +103,7 @@ pub fn free_up_space_cli() {
     #[cfg(target_os = "windows")]
     let _connection = {
         let root = sync::sync_root();
-        let fetcher: hydration::Fetcher = std::sync::Arc::new(|_identity, _offset, _length| {
+        let fetcher: hydration::Fetcher = std::sync::Arc::new(|_identity, _offset, _length, _file_size| {
             Box::pin(async { Err("Hardwave Workspace is not running".to_string()) })
         });
         match runtime.block_on(async { hydration::connect(&root, fetcher) }) {
@@ -310,12 +310,24 @@ fn setup_flag() -> std::path::PathBuf {
     dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("hardwave").join("workspace-setup-done")
 }
 
+/// Whether this PC had synced before the app started. Read once at start: the
+/// engine writes the index seconds after launch, so reading it later made a
+/// first start look like an update and skipped setup (Windows test 2026-10-09).
+static SYNCED_BEFORE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 #[tauri::command]
 fn get_setup() -> SetupState {
     let root = sync::sync_root();
-    let done = setup_flag().exists() || !sync::read_index().is_empty();
+    let done = setup_flag().exists() || SYNCED_BEFORE.get().copied().unwrap_or(false);
     let (free_bytes, file_system) = drive_info(&root);
     SetupState { done, folder: root.to_string_lossy().to_string(), free_bytes, file_system }
+}
+
+/// This computer's name as it reports to Workspace, so the This PC page can
+/// leave it out of "Your other computers".
+#[tauri::command]
+fn get_device_name() -> String {
+    device::device_name()
 }
 
 /// Finish setup with the choice for what stays on this PC: "when_opened"
@@ -772,6 +784,7 @@ async fn install_update(handle: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = SYNCED_BEFORE.set(!sync::read_index().is_empty());
     tauri::Builder::default()
         // Must be registered first. A second launch focuses the running window
         // instead of starting another copy — two instances meant two tray icons
@@ -1014,6 +1027,7 @@ pub fn run() {
             drag_sound,
             get_setup,
             finish_setup,
+            get_device_name,
             get_recent,
             show_main,
             pause_sync,
