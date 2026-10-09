@@ -326,6 +326,11 @@ pub struct SyncEngine {
     overview_cache: Mutex<Option<(std::time::Instant, FolderOverview)>>,
     /// The last things that moved, for the tray panel.
     recent: Mutex<std::collections::VecDeque<Activity>>,
+    /// Folder names of the signed-in account's workspaces, from the last full
+    /// pass. The sync folder can also hold another account's workspaces (two
+    /// accounts on one PC); totals and the folder list leave those out.
+    /// None until the first pass has listed the workspaces.
+    own_workspaces: RwLock<Option<Vec<String>>>,
 }
 
 /// One line in the tray panel: "↑ Face Of Fire.flp, 4 min ago".
@@ -366,6 +371,7 @@ impl SyncEngine {
             self_writes: Arc::new(Mutex::new(HashMap::new())),
             modes: Arc::new(Mutex::new(pins::load())),
             overview_cache: Mutex::new(None),
+            own_workspaces: RwLock::new(None),
             recent: Mutex::new(std::collections::VecDeque::new()),
         }
     }
@@ -475,15 +481,20 @@ impl SyncEngine {
                 return (f, b);
             }
         }
-        let (f, b) = tokio::task::spawn_blocking(Self::scan_disk_totals)
+        let own = self.own_workspaces.read().await.clone();
+        let (f, b) = tokio::task::spawn_blocking(move || Self::scan_disk_totals(own.as_deref()))
             .await
             .unwrap_or((0, 0));
         *self.disk_cache.write().await = Some((std::time::Instant::now(), f, b));
         (f, b)
     }
 
-    fn scan_disk_totals() -> (u32, u64) {
-        let files = scan_local(&sync_root());
+    fn scan_disk_totals(own: Option<&[String]>) -> (u32, u64) {
+        let root = sync_root();
+        let files = match own {
+            Some(names) => names.iter().flat_map(|n| scan_local(&root.join(n))).collect(),
+            None => scan_local(&root),
+        };
         let bytes: u64 = files.iter().map(|(_, _, s)| *s).sum();
         (files.len() as u32, bytes)
     }
@@ -600,7 +611,8 @@ impl SyncEngine {
             }
         }
         let modes = self.modes.lock().await.clone();
-        let overview = tokio::task::spawn_blocking(move || build_overview(&sync_root(), &modes))
+        let own = self.own_workspaces.read().await.clone();
+        let overview = tokio::task::spawn_blocking(move || build_overview(&sync_root(), &modes, own.as_deref()))
             .await
             .unwrap_or_default();
         *self.overview_cache.lock().await = Some((std::time::Instant::now(), overview.clone()));
@@ -1128,6 +1140,13 @@ impl SyncEngine {
         let root = sync_root();
         let workspaces = api::list_workspaces(token).await?;
         log::info!("[Sync] Full sync: {} workspace(s)", workspaces.len());
+        let own: Vec<String> = workspaces.iter().filter(|w| is_safe_component(&w.name)).map(|w| w.name.clone()).collect();
+        let changed = self.own_workspaces.read().await.as_ref() != Some(&own);
+        if changed {
+            *self.own_workspaces.write().await = Some(own);
+            *self.disk_cache.write().await = None;
+            *self.overview_cache.lock().await = None;
+        }
 
         for ws in &workspaces {
             if !is_safe_component(&ws.name) {
@@ -1884,7 +1903,7 @@ pub struct FolderOverview {
 
 /// Walk the sync root once: a placeholder counts as online only (its size is
 /// what Explorer shows), every other file as here.
-fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>) -> FolderOverview {
+fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<&[String]>) -> FolderOverview {
     fn skip(name: &str) -> bool {
         name.starts_with('.') || crate::rules::is_excluded(name)
     }
@@ -1928,7 +1947,7 @@ fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>) -> FolderOve
     ws_dirs.sort();
     for ws in ws_dirs {
         let ws_name = ws.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        if ws_name.starts_with('.') {
+        if ws_name.starts_with('.') || own.is_some_and(|o| !o.contains(&ws_name)) {
             continue;
         }
         // Each file is read once: a workspace's totals are its loose files plus
@@ -2562,5 +2581,34 @@ mod redact_token_tests {
     #[test]
     fn leaves_ordinary_text_alone() {
         assert_eq!(redact_token("nothing to hide here"), "nothing to hide here");
+    }
+}
+
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    #[test]
+    fn the_folder_list_counts_each_file_once_and_only_this_accounts_workspaces() {
+        let root = std::env::temp_dir().join(format!("hw-overview-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Mine/Kicks")).unwrap();
+        std::fs::create_dir_all(root.join("Someone else/Leads")).unwrap();
+        std::fs::write(root.join("Mine/loose.txt"), b"12345").unwrap();
+        std::fs::write(root.join("Mine/Kicks/kick.wav"), b"1234567890").unwrap();
+        std::fs::write(root.join("Someone else/Leads/lead.wav"), b"123").unwrap();
+
+        let own = vec!["Mine".to_string()];
+        let o = build_overview(&root, &HashMap::new(), Some(&own));
+        let names: Vec<&str> = o.rows.iter().map(|r| r.folder.as_str()).collect();
+        assert_eq!(names, ["Mine", "Mine/Kicks"]);
+        assert_eq!((o.rows[0].files, o.rows[0].bytes_here), (2, 15));
+        assert_eq!((o.rows[1].files, o.rows[1].bytes_here), (1, 10));
+        assert_eq!(o.bytes_here, 15);
+
+        // Before the first pass has listed the workspaces, every folder shows.
+        let all = build_overview(&root, &HashMap::new(), None);
+        assert_eq!(all.rows.len(), 4);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
