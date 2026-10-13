@@ -80,6 +80,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Azure Trusted Signing, the same way the DAW and the Suite sign: Tauri runs
+          # scripts/sign-windows.ps1 on every file it bundles, before the updater signature is
+          # taken. On a release tag a missing setting stops the build: nothing ships unsigned.
+          # Without the settings a manual build is left unsigned and says so.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          AZURE_TRUSTED_SIGNING_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
         with:
           tagName: ${{ github.event_name == 'push' && 'v__VERSION__' || '' }}
           releaseName: 'Hardwave Workspace v__VERSION__'
