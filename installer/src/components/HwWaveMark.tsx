@@ -1,17 +1,22 @@
-/** The Hardwave mark: the wave in a rounded square, as on the site and in the app. */
+/** The Workspace mark: the wave in a rounded square, in the Workspace purple, as in the app. */
 export function HwWaveMark({ className = 'bigmark' }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 200 200" aria-hidden="true">
       <defs>
         <linearGradient id="hw-wv" x1="40" y1="100" x2="160" y2="100" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#DC2626" stopOpacity=".35" />
-          <stop offset=".15" stopColor="#DC2626" />
-          <stop offset=".5" stopColor="#EF4444" />
-          <stop offset=".85" stopColor="#DC2626" />
-          <stop offset="1" stopColor="#DC2626" stopOpacity=".35" />
+          <stop offset="0" stopColor="#A855F7" stopOpacity=".35" />
+          <stop offset=".15" stopColor="#A855F7" />
+          <stop offset=".5" stopColor="#C084FC" />
+          <stop offset=".85" stopColor="#A855F7" />
+          <stop offset="1" stopColor="#A855F7" stopOpacity=".35" />
         </linearGradient>
+        <radialGradient id="hw-gl" cx="100" cy="100" r="65" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stopColor="#A855F7" stopOpacity=".2" />
+          <stop offset="1" stopColor="#A855F7" stopOpacity="0" />
+        </radialGradient>
       </defs>
       <rect x="20" y="20" width="160" height="160" rx="34" fill="#151517" stroke="rgba(255,255,255,.08)" />
+      <ellipse cx="100" cy="100" rx="65" ry="50" fill="url(#hw-gl)" />
       <path d="M40 100 H52 L58 93 L66 58 L74 138 L82 68 L88 130 L94 86 L100 114 L106 94 L112 106 L118 100 H160" stroke="url(#hw-wv)" strokeWidth="7" strokeLinecap="round" strokeLinejoin="round" fill="none" />
     </svg>
   )
@@ -28,4 +33,9 @@ export function Bars({ faint = false }: { faint?: boolean }) {
       {bars.map(([a, b, d], i) => <i key={i} style={{ ['--a' as string]: a, ['--b' as string]: b, animationDelay: `${d}s` }} />)}
     </div>
   )
+}
+
+/** The wordmark under the mark: HARDWAVE over WORKSPACE, as in the app's sidebar. */
+export function Wordmark() {
+  return <div className="wm"><b>HARDWAVE</b><i>WORKSPACE</i></div>
 }

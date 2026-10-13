@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion'
-import { HwWaveMark, Bars } from '../components/HwWaveMark'
+import { HwWaveMark, Bars, Wordmark } from '../components/HwWaveMark'
 
 export function Splash() {
   return (
@@ -9,8 +9,8 @@ export function Splash() {
           <HwWaveMark />
         </motion.div>
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3, duration: 0.5 }}>
-          <h1 className="t big">Hardwave</h1>
-          <p className="sub">The studio for harder styles</p>
+          <Wordmark />
+          <p className="sub">Your projects and samples, backed up from this PC.</p>
         </motion.div>
       </div>
       <Bars />
