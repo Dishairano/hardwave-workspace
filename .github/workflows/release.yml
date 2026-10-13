@@ -69,6 +69,11 @@ jobs:
             let conf = fs.readFileSync('tauri.conf.json','utf8');
             conf = conf.replace(/\"version\": \"[^\"]*\"/, '\"version\": \"'+'$VERSION'+'\"');
             fs.writeFileSync('tauri.conf.json', conf);
+            // The User-Agent the app sends carries the version too (workspace.hardwavestudios.com
+            // reads it to tell the app from a browser).
+            for (const f of ['tauri.windows.conf.json','tauri.macos.conf.json','tauri.linux.conf.json']) {
+              fs.writeFileSync(f, fs.readFileSync(f,'utf8').replace(/HardwaveWorkspace\/[0-9][^" ]*/, 'HardwaveWorkspace/'+'$VERSION'));
+            }
             let cargo = fs.readFileSync('Cargo.toml','utf8');
             cargo = cargo.replace(/^version = \"[^\"]*\"/m, 'version = \"'+'$VERSION'+'\"');
             fs.writeFileSync('Cargo.toml', cargo);
