@@ -46,7 +46,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "signCommand": "pwsh -NoProfile -ExecutionPolicy Bypass -File ../scripts/sign-windows.ps1 %1"
+    }
   },
   "plugins": {
     "updater": {
