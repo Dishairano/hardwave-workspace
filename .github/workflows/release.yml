@@ -101,6 +101,75 @@ jobs:
           prerelease: false
           args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
+      # The custom installer (the same four-screen setup app as the Suite, 2026-10-10 A2): it
+      # downloads this zip from the release and unpacks it, so the zip is the payload and
+      # HardwaveWorkspace-Setup.exe is what the site hands out.
+      - name: Create portable Windows zip
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $staging = "staging/Hardwave Workspace"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          $rawExe = Get-ChildItem -Path src-tauri/target/release -Filter "hardwave-workspace.exe" -File | Select-Object -First 1
+          if (-not $rawExe) { throw "hardwave-workspace.exe not found in target/release" }
+          Copy-Item $rawExe.FullName "$staging/Hardwave Workspace.exe"
+          Get-ChildItem -Path src-tauri/target/release -Filter *.dll -File -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-Item $_.FullName "$staging/"
+          }
+          if (Test-Path "src-tauri/target/release/resources") {
+            Copy-Item "src-tauri/target/release/resources" "$staging/resources" -Recurse
+          }
+          Compress-Archive -Path "$staging/*" -DestinationPath "hardwave-workspace-portable-windows.zip" -Force
+          Get-Item hardwave-workspace-portable-windows.zip | Select-Object Name,Length
+
+      - name: Build the Workspace installer (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        working-directory: installer
+        run: |
+          npm install
+          # Skip the Tauri bundler: the raw .exe is the installer, not another NSIS wrap.
+          npm run tauri:build -- --no-bundle
+
+      - name: Stage installer as HardwaveWorkspace-Setup.exe
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $installerExe = Get-ChildItem -Path installer/src-tauri/target/release -Filter "hardwave-workspace-installer.exe" -File | Select-Object -First 1
+          if (-not $installerExe) { throw "hardwave-workspace-installer.exe not found" }
+          Copy-Item $installerExe.FullName "HardwaveWorkspace-Setup.exe"
+          Get-Item HardwaveWorkspace-Setup.exe | Select-Object Name,Length
+
+      # Built with --no-bundle, so Tauri's signing never sees it: signed here, with the same
+      # script and the same rule (a release that cannot be signed stops).
+      - name: Sign HardwaveWorkspace-Setup.exe
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          AZURE_TRUSTED_SIGNING_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_PROFILE }}
+        run: ./scripts/sign-windows.ps1 HardwaveWorkspace-Setup.exe
+
+      - name: Upload the installer and the zip to the release
+        if: matrix.platform == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF#refs/tags/}" HardwaveWorkspace-Setup.exe hardwave-workspace-portable-windows.zip --clobber
+
+      - name: Upload the installer (manual runs only)
+        if: matrix.platform == 'windows-latest' && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-setup-windows
+          path: |
+            HardwaveWorkspace-Setup.exe
+            hardwave-workspace-portable-windows.zip
+
       - name: Upload installers (manual runs only)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
