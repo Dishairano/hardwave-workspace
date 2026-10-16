@@ -1821,6 +1821,14 @@ async fn reconcile_from_server(
                 format!("{}/{}/{}", ws.name, folder, rf.name)
             };
 
+            // The workspace name, folder and file name come from the server, and a workspace
+            // editor chooses them. A name with ".." or a drive in it must never be joined to the
+            // sync root: freeing space replaces the local file at that path with a placeholder.
+            if !is_safe_rel_path(&rel_path) {
+                log::warn!("[FreeSpace] skipped a server file with an unsafe path");
+                continue;
+            }
+
             // Already known and usable.
             if index.get(&rel_path).is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some()) {
                 continue;
@@ -2108,7 +2116,9 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>)
             Some(f) => rel.len() > f.len() && rel.starts_with(f) && rel.as_bytes()[f.len()] == b'/',
             None => true,
         };
-        inside && pins::mode_for(rel, &modes) != pins::Mode::Always
+        // Every path freed here is joined to the sync root, so it has to stay inside it, whether
+        // it came from the server listing or from an older index.
+        inside && is_safe_rel_path(rel) && pins::mode_for(rel, &modes) != pins::Mode::Always
     };
 
     // Work from the running engine's index when there is one. Reading and

@@ -345,17 +345,28 @@ fn get_device_name() -> String {
 /// each folder can be changed later on the This PC page.
 #[tauri::command]
 async fn finish_setup(choice: pins::Mode, state: State<'_, AppState>) -> Result<(), String> {
+    // Setup is only marked done once the choice is applied to every folder. Marking it done
+    // anyway left a producer who chose "always" or "online" on "when opened" for good, because
+    // setup never asks again.
     if choice != pins::Mode::WhenOpened {
-        if let Some(engine) = state.engine().await {
-            let root = sync::sync_root();
-            if let Ok(entries) = std::fs::read_dir(&root) {
-                for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if e.path().is_dir() && !name.starts_with('.') {
-                        let _ = engine.set_folder_mode(&name, choice).await;
+        let engine = state
+            .engine()
+            .await
+            .ok_or_else(|| "Hardwave Workspace is still starting. Try again in a moment.".to_string())?;
+        let root = sync::sync_root();
+        let mut failed: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() && !name.starts_with('.') {
+                    if let Err(err) = engine.set_folder_mode(&name, choice).await {
+                        failed.push(format!("{name}: {err}"));
                     }
                 }
             }
+        }
+        if !failed.is_empty() {
+            return Err(format!("Could not set every folder: {}", failed.join("; ")));
         }
     }
     let flag = setup_flag();

@@ -76,9 +76,10 @@ pub fn mode_for(rel_path: &str, modes: &HashMap<String, Mode>) -> Mode {
 pub fn set(modes: &mut HashMap<String, Mode>, folder: &str, mode: Mode) {
     let prefix = format!("{folder}/");
     modes.retain(|f, _| !f.starts_with(&prefix));
-    if mode == Mode::WhenOpened {
-        modes.remove(folder);
-    } else {
+    modes.remove(folder);
+    // Stored only where it differs from what the folder inherits. Dropping every "When opened"
+    // left a subfolder of an "Always" folder on Always, so the producer could not change it.
+    if mode_for(folder, modes) != mode {
         modes.insert(folder.to_string(), mode);
     }
 }
@@ -95,6 +96,20 @@ mod tests {
         assert_eq!(mode_for("Studio/FL Studio/Face Of Fire.flp", &m), Mode::Always);
         assert_eq!(mode_for("Studio/FL Studio/Old/2019.flp", &m), Mode::Online);
         assert_eq!(mode_for("Studio/Sounds/kick.wav", &m), Mode::WhenOpened);
+    }
+
+    #[test]
+    fn when_opened_under_an_always_folder_takes_effect() {
+        let mut m = HashMap::new();
+        set(&mut m, "Studio", Mode::Always);
+        set(&mut m, "Studio/FL", Mode::WhenOpened);
+        assert_eq!(mode_for("Studio/FL/a.flp", &m), Mode::WhenOpened);
+        assert_eq!(mode_for("Studio/Sounds/kick.wav", &m), Mode::Always);
+        // Back to what it inherits: nothing left to store for the subfolder.
+        set(&mut m, "Studio/FL", Mode::Always);
+        assert_eq!(m.len(), 1);
+        set(&mut m, "Studio", Mode::WhenOpened);
+        assert!(m.is_empty());
     }
 
     #[test]
