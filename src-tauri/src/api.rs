@@ -58,7 +58,7 @@ pub async fn with_retry<T>(
             Ok(val) => return Ok(val),
             Err(e) => {
                 last_err = e;
-                eprintln!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
+                log::warn!("[API] Retry {}/{} failed: {}", attempt, max_retries, last_err);
             }
         }
     }
@@ -207,6 +207,38 @@ pub async fn list_folders(token: &str, workspace_id: &str) -> Result<Vec<Workspa
     };
 
     Ok(folders)
+}
+
+/// What Workspace holds for one file right now (its checksum, size and time).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileState {
+    pub sha256: Option<String>,
+    #[serde(rename = "sizeBytes", default)]
+    pub size: u64,
+    #[serde(rename = "savedAt", default)]
+    pub updated_at: Option<String>,
+}
+
+/// The current state of one file, from the file page's info route. `None`
+/// when the file is gone (deleted or in the trash) or the server is older and
+/// does not send a checksum yet.
+pub async fn file_state(token: &str, workspace_id: &str, file_id: &str) -> Result<Option<FileState>, String> {
+    let res = http_client()
+        .get(format!("{}/workspaces/{}/files/{}/info", WS_BASE, workspace_id, file_id))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to read file state: {}", e))?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !res.status().is_success() {
+        return Err(format!("API error: {}", res.status()));
+    }
+    let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let Some(file) = data.get("file") else { return Ok(None) };
+    let state: FileState = serde_json::from_value(file.clone()).map_err(|e| e.to_string())?;
+    Ok(state.sha256.is_some().then_some(state))
 }
 
 /// Get a presigned download URL for a file.
@@ -615,7 +647,7 @@ async fn send_part(
             Ok(Err(e)) => last_err = format!("part {number}: {e}"),
             Err(_) => last_err = format!("part {number}: timed out after {} s", deadline.as_secs()),
         }
-        eprintln!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
+        log::warn!("[API] Part {number} attempt {}/{} failed: {last_err}", attempt + 1, PART_ATTEMPTS);
     }
     Err(format!("Upload failed at part {number}: {last_err}"))
 }

@@ -14,8 +14,10 @@ use std::path::Path;
 
 /// Resolves a file identity (what we stored on the placeholder) to bytes.
 /// The sync engine supplies this so this module stays free of API details.
+/// Arguments: identity, offset, length, and the placeholder's own file size,
+/// so the fetcher can refuse bytes from a different version of the file.
 pub type Fetcher = std::sync::Arc<
-    dyn Fn(String, u64, u64) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
+    dyn Fn(String, u64, u64, u64) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
         + Send
         + Sync,
 >;
@@ -55,7 +57,7 @@ mod imp {
     /// Hydration failures are invisible in a GUI app, so mirror them to a file
     /// next to the app data where they can actually be read.
     fn log_line(msg: &str) {
-        eprintln!("[Hydration] {msg}");
+        log::info!("[Hydration] {msg}");
         if let Ok(dir) = std::env::var("LOCALAPPDATA") {
             let p = std::path::Path::new(&dir).join("hardwave-workspace-hydration.log");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
@@ -112,6 +114,7 @@ mod imp {
 
         let key = info.ConnectionKey;
         let txn = info.TransferKey;
+        let file_size = info.FileSize.max(0) as u64;
 
         let Some(fetch) = FETCHER.get().cloned() else {
             fail_transfer(key, txn, offset, length);
@@ -126,7 +129,7 @@ mod imp {
             return;
         };
         log_line(&format!("fetch {identity} offset={offset} len={length}"));
-        let fut = fetch(identity.clone(), offset, length);
+        let fut = fetch(identity.clone(), offset, length, file_size);
         rt.spawn(async move {
             match fut.await {
                 Ok(bytes) => {

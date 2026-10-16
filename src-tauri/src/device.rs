@@ -115,7 +115,7 @@ pub async fn run(handle: tauri::AppHandle) {
         if let (Some(token), Some(engine)) = (token, engine) {
             let status = engine.get_status().await;
             if let Err(e) = send(&token, &id, &status).await {
-                eprintln!("[device] {}", e);
+                log::warn!("[device] {}", e);
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(EVERY_SECS)).await;
