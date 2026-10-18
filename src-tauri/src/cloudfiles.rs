@@ -34,12 +34,20 @@ pub struct RemoteFile {
 mod imp {
     use super::*;
 
-    pub fn is_supported() -> bool { false }
+    pub fn is_supported() -> bool {
+        false
+    }
     pub fn register(_root: &Path, _provider_name: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
-    pub fn unregister(_root: &Path) -> Result<(), String> { Ok(()) }
-    pub fn create_placeholders(_root: &Path, _dir: &str, _files: &[RemoteFile]) -> Result<u32, String> {
+    pub fn unregister(_root: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    pub fn create_placeholders(
+        _root: &Path,
+        _dir: &str,
+        _files: &[RemoteFile],
+    ) -> Result<u32, String> {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn replace_with_placeholder(
@@ -50,11 +58,18 @@ mod imp {
     ) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
-    pub fn is_placeholder(_path: &Path) -> bool { false }
+    pub fn is_placeholder(_path: &Path) -> bool {
+        false
+    }
     pub fn dehydrate(_path: &Path, _identity: &str) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
-    pub fn refresh_placeholder(_root: &Path, _rel_path: &str, _size: u64, _identity: &str) -> Result<(), String> {
+    pub fn refresh_placeholder(
+        _root: &Path,
+        _rel_path: &str,
+        _size: u64,
+        _identity: &str,
+    ) -> Result<(), String> {
         Err("Files On-Demand is Windows only".into())
     }
     pub fn set_pin(_path: &Path, _pin: Pin) -> Result<(), String> {
@@ -104,7 +119,11 @@ mod imp {
     /// Claim a directory tree as ours. Safe to call repeatedly: the UPDATE flag
     /// re-registers rather than failing on an existing root.
     pub fn register(root: &Path, provider_name: &str) -> Result<(), String> {
-        register_with(root, provider_name, CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0))
+        register_with(
+            root,
+            provider_name,
+            CF_POPULATION_POLICY_PRIMARY(CF_POPULATION_POLICY_ALWAYS_FULL.0),
+        )
     }
 
     fn register_with(
@@ -194,7 +213,11 @@ mod imp {
             return Ok(0);
         }
 
-        let target: PathBuf = if dir.is_empty() { root.to_path_buf() } else { root.join(dir) };
+        let target: PathBuf = if dir.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(dir)
+        };
         std::fs::create_dir_all(&target).map_err(|e| format!("create dir: {e}"))?;
         let target_w = wide(&target.to_string_lossy());
 
@@ -303,14 +326,26 @@ mod imp {
     /// A cloud-only placeholder whose file changed in Workspace: it still
     /// carries the old size, and Windows refuses to hydrate data that does not
     /// match it. It holds no bytes, so it is removed and made again.
-    pub fn refresh_placeholder(root: &Path, rel_path: &str, size: u64, identity: &str) -> Result<(), String> {
+    pub fn refresh_placeholder(
+        root: &Path,
+        rel_path: &str,
+        size: u64,
+        identity: &str,
+    ) -> Result<(), String> {
         let path = root.join(rel_path.replace('/', "\\"));
         if !is_placeholder(&path) {
-            return Err(format!("{} is not a cloud-only placeholder", path.display()));
+            return Err(format!(
+                "{} is not a cloud-only placeholder",
+                path.display()
+            ));
         }
         std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
         let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let file = RemoteFile { rel_path: rel_path.to_string(), size, identity: identity.to_string() };
+        let file = RemoteFile {
+            rel_path: rel_path.to_string(),
+            size,
+            identity: identity.to_string(),
+        };
         match create_placeholders(root, dir, &[file]) {
             Ok(1) => Ok(()),
             Ok(n) => Err(format!("created {n} placeholders for one file")),
@@ -349,10 +384,17 @@ mod imp {
             Pin::Unspecified => CF_PIN_STATE_UNSPECIFIED,
             Pin::Unpinned => CF_PIN_STATE_UNPINNED,
         };
-        let flags = if path.is_dir() { CF_SET_PIN_FLAG_RECURSE } else { CF_SET_PIN_FLAG_NONE };
+        let flags = if path.is_dir() {
+            CF_SET_PIN_FLAG_RECURSE
+        } else {
+            CF_SET_PIN_FLAG_NONE
+        };
         let handle = open_rw(path)?;
-        let res = unsafe { CfSetPinState(handle, state, flags, None) }.map_err(|e| err(e.code(), "CfSetPinState"));
-        unsafe { let _ = CloseHandle(handle); }
+        let res = unsafe { CfSetPinState(handle, state, flags, None) }
+            .map_err(|e| err(e.code(), "CfSetPinState"));
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
         res
     }
 
@@ -364,7 +406,9 @@ mod imp {
         // Length -1 means the whole file.
         let res = unsafe { CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None) }
             .map_err(|e| err(e.code(), "CfHydratePlaceholder"));
-        unsafe { let _ = CloseHandle(handle); }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
         res
     }
 
@@ -423,7 +467,9 @@ mod imp {
                 .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
         });
 
-        unsafe { let _ = CloseHandle(handle); }
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
         res
     }
 
@@ -447,6 +493,6 @@ mod imp {
 
 #[allow(unused_imports)]
 pub use imp::{
-    create_placeholders, dehydrate, hydrate, is_placeholder, is_supported, refresh_placeholder, register,
-    replace_with_placeholder, set_pin, unregister,
+    create_placeholders, dehydrate, hydrate, is_placeholder, is_supported, refresh_placeholder,
+    register, replace_with_placeholder, set_pin, unregister,
 };

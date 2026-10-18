@@ -17,7 +17,12 @@ use std::path::Path;
 /// Arguments: identity, offset, length, and the placeholder's own file size,
 /// so the fetcher can refuse bytes from a different version of the file.
 pub type Fetcher = std::sync::Arc<
-    dyn Fn(String, u64, u64, u64) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
+    dyn Fn(
+            String,
+            u64,
+            u64,
+            u64,
+        ) -> futures_util::future::BoxFuture<'static, Result<Vec<u8>, String>>
         + Send
         + Sync,
 >;
@@ -60,7 +65,11 @@ mod imp {
         log::info!("[Hydration] {msg}");
         if let Ok(dir) = std::env::var("LOCALAPPDATA") {
             let p = std::path::Path::new(&dir).join("hardwave-workspace-hydration.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
                 use std::io::Write;
                 let _ = writeln!(f, "{:?} {}", std::time::SystemTime::now(), msg);
             }
@@ -98,7 +107,9 @@ mod imp {
                 String::new()
             } else {
                 let slice = std::slice::from_raw_parts(ptr, len);
-                String::from_utf16_lossy(slice).trim_end_matches('\0').to_string()
+                String::from_utf16_lossy(slice)
+                    .trim_end_matches('\0')
+                    .to_string()
             }
         };
 
@@ -157,7 +168,8 @@ mod imp {
                 let mut params: CF_OPERATION_PARAMETERS = std::mem::zeroed();
                 params.ParamSize = size_of::<CF_OPERATION_PARAMETERS>() as u32;
                 params.Anonymous.TransferData.CompletionStatus = NTSTATUS(0); // STATUS_SUCCESS
-                params.Anonymous.TransferData.Buffer = data.as_ptr().add(sent as usize) as *const c_void;
+                params.Anonymous.TransferData.Buffer =
+                    data.as_ptr().add(sent as usize) as *const c_void;
                 params.Anonymous.TransferData.Offset = (offset + sent) as i64;
                 params.Anonymous.TransferData.Length = n as i64;
 
@@ -168,7 +180,10 @@ mod imp {
                 op.TransferKey = txn;
 
                 if let Err(e) = CfExecute(&op, &mut params) {
-                    log_line(&format!("CfExecute failed at offset {}: {e:?}", offset + sent));
+                    log_line(&format!(
+                        "CfExecute failed at offset {}: {e:?}",
+                        offset + sent
+                    ));
                     return;
                 }
             }
@@ -225,7 +240,13 @@ mod imp {
                 CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
             )
         }
-        .map_err(|e| format!("CfConnectSyncRoot failed: 0x{:08X} — {}", e.code().0, e.message()))?;
+        .map_err(|e| {
+            format!(
+                "CfConnectSyncRoot failed: 0x{:08X} — {}",
+                e.code().0,
+                e.message()
+            )
+        })?;
 
         Ok(Connection { key })
     }

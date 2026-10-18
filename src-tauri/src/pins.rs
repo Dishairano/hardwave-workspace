@@ -93,7 +93,10 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("Studio/FL Studio".to_string(), Mode::Always);
         m.insert("Studio/FL Studio/Old".to_string(), Mode::Online);
-        assert_eq!(mode_for("Studio/FL Studio/Face Of Fire.flp", &m), Mode::Always);
+        assert_eq!(
+            mode_for("Studio/FL Studio/Face Of Fire.flp", &m),
+            Mode::Always
+        );
         assert_eq!(mode_for("Studio/FL Studio/Old/2019.flp", &m), Mode::Online);
         assert_eq!(mode_for("Studio/Sounds/kick.wav", &m), Mode::WhenOpened);
     }
