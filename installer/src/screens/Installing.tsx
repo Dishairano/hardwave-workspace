@@ -16,7 +16,7 @@ export function Installing({ progress, version, error, onRetry, onCancel }: Prop
   const pct = Math.max(0, Math.min(100, Math.round(progress.percent)))
   const at = ORDER.indexOf(progress.phase)
   const steps: Array<[string, number]> = [
-    [version ? `Download Hardwave ${version}` : 'Download Hardwave', 0],
+    [version ? `Download Hardwave Workspace ${version}` : 'Download Hardwave Workspace', 0],
     ['Unpack', 1],
     ['Shortcuts', 2],
     ['Ready to sign in', 3],
