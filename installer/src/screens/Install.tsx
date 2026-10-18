@@ -43,7 +43,7 @@ export function Install({ version, installDir, setInstallDir, desktopShortcut, s
           <div className="cap">Install</div>
           <h1 className="t">Your projects and samples, backed up from this PC.</h1>
           <p className="sub">Sign in once. Every save uploads on its own, and your files show up in Explorer.</p>
-          {version && <div className="ver">Hardwave {version.version}</div>}
+          {version && <div className="ver">Hardwave Workspace {version.version}</div>}
           <div className="field"><span className="path" title={installDir}>{installDir || '…'}</span><button type="button" onClick={pick}>Change</button></div>
           {error && <div className="err">{error}</div>}
           <button type="button" className="opt" onClick={() => setDesktopShortcut(!desktopShortcut)}><i className={desktopShortcut ? 'on' : ''} />Desktop shortcut</button>
