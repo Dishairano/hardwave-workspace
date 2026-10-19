@@ -390,8 +390,11 @@ mod imp {
             CF_SET_PIN_FLAG_NONE
         };
         let handle = open_rw(path)?;
+        // SAFETY: `handle` was just opened by open_rw and stays open until the CloseHandle below;
+        // state and flags are plain values, and None is an allowed overlapped argument.
         let res = unsafe { CfSetPinState(handle, state, flags, None) }
             .map_err(|e| err(e.code(), "CfSetPinState"));
+        // SAFETY: `handle` came from open_rw, is closed exactly once, and is not used afterwards.
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -404,8 +407,11 @@ mod imp {
         use windows::Win32::Foundation::CloseHandle;
         let handle = open_rw(path)?;
         // Length -1 means the whole file.
+        // SAFETY: `handle` was just opened by open_rw and stays open until the CloseHandle below;
+        // offset 0 and length -1 are the documented "whole file" range, and None is allowed.
         let res = unsafe { CfHydratePlaceholder(handle, 0, -1, CF_HYDRATE_FLAG_NONE, None) }
             .map_err(|e| err(e.code(), "CfHydratePlaceholder"));
+        // SAFETY: `handle` came from open_rw, is closed exactly once, and is not used afterwards.
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -463,10 +469,13 @@ mod imp {
 
         let res = converted.and_then(|()| {
             // Length -1 means the whole file.
+            // SAFETY: `handle` is the open handle from above and is only closed after this call;
+            // offset 0 and length -1 are the documented "whole file" range, and None is allowed.
             unsafe { CfDehydratePlaceholder(handle, 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
                 .map_err(|e| err(e.code(), "CfDehydratePlaceholder"))
         });
 
+        // SAFETY: `handle` was opened above, is closed exactly once here, and is not used afterwards.
         unsafe {
             let _ = CloseHandle(handle);
         }

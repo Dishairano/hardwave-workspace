@@ -438,6 +438,8 @@ fn drive_info(path: &std::path::Path) -> (Option<u64>, Option<String>) {
         .chain(std::iter::once(0))
         .collect();
     let mut free: u64 = 0;
+    // SAFETY: `w` is a NUL-terminated UTF-16 path that outlives the call, and `free` is a valid
+    // u64 the call writes into; the two optional outputs we do not need are None.
     let free_ok =
         unsafe { GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }.is_ok();
     let root: String = path
@@ -447,6 +449,8 @@ fn drive_info(path: &std::path::Path) -> (Option<u64>, Option<String>) {
         .unwrap_or_default();
     let root_w: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
     let mut fs_name = [0u16; 64];
+    // SAFETY: `root_w` is a NUL-terminated UTF-16 root path that outlives the call, and `fs_name`
+    // is a 64-element buffer whose length the slice passes along; every other output is None.
     let fs_ok = unsafe {
         GetVolumeInformationW(
             PCWSTR(root_w.as_ptr()),
