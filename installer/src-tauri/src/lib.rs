@@ -7,16 +7,38 @@
 //!   3. Downloads a portable zip of the Workspace app from the GitHub release.
 //!   4. Extracts it, creates shortcuts, registers an uninstall entry.
 //!   5. Launches the Workspace app.
+//!
+//! Started in uninstall mode (see `mode`), the same window shows the
+//! uninstall screens instead, and never the install screens.
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 mod install;
+mod mode;
+// The uninstall steps run on Windows; the tests check them on every platform.
+#[cfg(any(windows, test))]
+mod removal;
 #[cfg(windows)]
 mod shortcut;
 #[cfg(windows)]
 mod uninstall;
+
+/// Uninstalling is for Windows: elsewhere the window's uninstall commands say so.
+#[cfg(not(windows))]
+mod uninstall {
+    #[tauri::command]
+    pub fn uninstall_overview() -> String {
+        String::new()
+    }
+
+    #[tauri::command]
+    pub fn start_uninstall(delete_local_copies: bool) -> Result<(), String> {
+        let _ = delete_local_copies;
+        Err("Uninstall is only supported on Windows.".to_string())
+    }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -47,6 +69,9 @@ pub struct InstallState {
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Which screens the window shows, decided once at start-up by `mode::decide`.
+struct LaunchMode(&'static str);
+
 // ─── Commands ────────────────────────────────────────────────────────────────
 
 /// Probe the Hardwave updater endpoint to find the latest version and the
@@ -61,7 +86,9 @@ async fn fetch_latest_version() -> Result<LatestVersion, String> {
 
     // Primary: Hardwave API. Fallback: GitHub latest release tag.
     let primary_res = client
-        .get("https://github.com/Dishairano/hardwave-workspace/releases/latest/download/latest.json")
+        .get(
+            "https://github.com/Dishairano/hardwave-workspace/releases/latest/download/latest.json",
+        )
         .send()
         .await;
 
@@ -71,8 +98,15 @@ async fn fetch_latest_version() -> Result<LatestVersion, String> {
                 if let Some(v) = body.get("version").and_then(|v| v.as_str()) {
                     return Ok(LatestVersion {
                         version: v.trim_start_matches('v').to_string(),
-                        notes: body.get("notes").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        pub_date: body.get("pub_date").and_then(|v| v.as_str()).map(str::to_string),
+                        notes: body
+                            .get("notes")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        pub_date: body
+                            .get("pub_date")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     });
                 }
             }
@@ -96,7 +130,10 @@ async fn fetch_latest_version() -> Result<LatestVersion, String> {
         .and_then(|v| v.as_str())
         .ok_or("GitHub release missing tag_name")?;
     let body = gh.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let pub_date = gh.get("published_at").and_then(|v| v.as_str()).map(str::to_string);
+    let pub_date = gh
+        .get("published_at")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     Ok(LatestVersion {
         version: tag.trim_start_matches('v').to_string(),
@@ -108,9 +145,7 @@ async fn fetch_latest_version() -> Result<LatestVersion, String> {
 /// Returns the default per-user install directory.
 #[tauri::command]
 fn default_install_dir() -> String {
-    install::default_install_dir()
-        .to_string_lossy()
-        .to_string()
+    install::default_install_dir().to_string_lossy().to_string()
 }
 
 /// Starts the full install pipeline. Emits `install://progress` events.
@@ -171,35 +206,78 @@ fn quit(app: AppHandle) {
     app.exit(0);
 }
 
+/// "install" or "uninstall": which screens the window shows.
+#[tauri::command]
+fn launch_mode(mode: State<'_, LaunchMode>) -> &'static str {
+    mode.0
+}
+
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Handle --uninstall flag: launch the uninstall path and exit.
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--uninstall") {
+    // Uninstall mode (an uninstall argument, or this exe is the copied
+    // "Hardwave Workspace Uninstaller.exe"): the window shows the uninstall
+    // screens, and --quiet removes the app without a window at all.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let exe = std::env::current_exe().ok();
+    let uninstalling = match mode::decide(&args, exe.as_deref()) {
+        mode::Mode::Install => false,
         #[cfg(windows)]
-        {
-            if let Err(e) = uninstall::uninstall() {
-                eprintln!("Uninstall failed: {e}");
-                std::process::exit(1);
-            }
+        mode::Mode::Uninstall { quiet: true } => std::process::exit(uninstall::run_quiet()),
+        #[cfg(windows)]
+        mode::Mode::Uninstall { quiet: false } => true,
+        #[cfg(not(windows))]
+        mode::Mode::Uninstall { quiet } => {
+            let _ = quiet;
+            eprintln!("Uninstall is only supported on Windows.");
+            std::process::exit(1);
         }
-        return;
-    }
+    };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(InstallState::default())
+        .manage(LaunchMode(if uninstalling {
+            "uninstall"
+        } else {
+            "install"
+        }));
+    #[cfg(windows)]
+    let builder = builder.manage(uninstall::UninstallState::default());
+
+    builder
+        .setup(move |app| {
+            if uninstalling {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_title("Uninstall Hardwave Workspace");
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             fetch_latest_version,
             default_install_dir,
             start_install,
             cancel_install,
             launch_installed,
-            quit
+            quit,
+            launch_mode,
+            uninstall::uninstall_overview,
+            uninstall::start_uninstall
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running hardwave-workspace-installer");
+        .build(tauri::generate_context!())
+        .expect("error while building hardwave-workspace-installer")
+        .run(|_app, _event| {
+            // A finished uninstall leaves the install folder, which held this
+            // exe; it is removed once the window has closed.
+            #[cfg(windows)]
+            if let tauri::RunEvent::Exit = _event {
+                uninstall::cleanup_after_exit(_app);
+            }
+        });
 }

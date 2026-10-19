@@ -24,6 +24,8 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], defau
 futures-util = "0.3"
 zip = "2"
 dirs = "5"
+# The uninstaller checks a downloaded copy against its upload before deleting it.
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
