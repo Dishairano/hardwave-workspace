@@ -312,11 +312,13 @@ fn wait_for_uploads(install_dir: &Path, detail: &dyn Fn(String)) -> Result<(), S
     .map_err(|n| Stopped {
         reason: format!(
             "Hardwave Workspace has not finished uploading {} from {}, so nothing was removed.\n\n\
-             Open Hardwave Workspace and leave it open until they are uploaded, then try again. \
+             Open Hardwave Workspace and leave it open until {} uploaded, then try again. \
              To keep the files on this PC instead, close this window and uninstall again with \
              the option off.",
             files(n),
-            root.display()
+            root.display(),
+            // "until it is uploaded" for one file (seen on HW-TEST-WIN, 2026-10-19), "they are" for more.
+            if n == 1 { "it is" } else { "they are" }
         ),
         still_uploading: Some(n),
     })
