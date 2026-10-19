@@ -26,7 +26,10 @@ pub enum Local {
     Missing,
     /// A cloud-only placeholder: no local bytes, nothing to lose.
     Placeholder,
-    File { size: u64, mtime: Option<i64> },
+    File {
+        size: u64,
+        mtime: Option<i64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,10 +67,18 @@ pub fn plan_remote(
     };
     match local {
         Local::Missing => {
-            if remote_changed { RemoteAction::Fetch } else { RemoteAction::Skip }
+            if remote_changed {
+                RemoteAction::Fetch
+            } else {
+                RemoteAction::Skip
+            }
         }
         Local::Placeholder => {
-            if remote_changed { RemoteAction::RefreshPlaceholder } else { RemoteAction::Skip }
+            if remote_changed {
+                RemoteAction::RefreshPlaceholder
+            } else {
+                RemoteAction::Skip
+            }
         }
         Local::File { size, mtime } => match entry {
             None if trusted => RemoteAction::Index,
@@ -85,7 +96,11 @@ pub fn plan_remote(
 }
 
 /// The decision once the local file's hash is known.
-pub fn after_hash(entry: Option<Indexed>, local_sha: &str, remote_sha: Option<&str>) -> RemoteAction {
+pub fn after_hash(
+    entry: Option<Indexed>,
+    local_sha: &str,
+    remote_sha: Option<&str>,
+) -> RemoteAction {
     if remote_sha == Some(local_sha) {
         return RemoteAction::Index;
     }
@@ -167,10 +182,21 @@ pub fn kept_name(file_name: &str, device: &str, taken: impl Fn(&str) -> bool) ->
         Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
         _ => (file_name, ""),
     };
-    let device: String = device.chars().filter(|c| !"\\/:*?\"<>|".contains(*c)).collect();
-    let device = if device.trim().is_empty() { "this PC".to_string() } else { device };
+    let device: String = device
+        .chars()
+        .filter(|c| !"\\/:*?\"<>|".contains(*c))
+        .collect();
+    let device = if device.trim().is_empty() {
+        "this PC".to_string()
+    } else {
+        device
+    };
     for n in 1..1000 {
-        let tag = if n == 1 { device.clone() } else { format!("{device} {n}") };
+        let tag = if n == 1 {
+            device.clone()
+        } else {
+            format!("{device} {n}")
+        };
         let name = format!("{stem} ({tag}){ext}");
         if !taken(&name) {
             return name;
@@ -183,30 +209,58 @@ pub fn kept_name(file_name: &str, device: &str, taken: impl Fn(&str) -> bool) ->
 mod tests {
     use super::*;
 
-    const E: Indexed = Indexed { sha: "aaa", size: 10, mtime: Some(100) };
+    const E: Indexed = Indexed {
+        sha: "aaa",
+        size: 10,
+        mtime: Some(100),
+    };
 
     #[test]
     fn a_new_remote_file_is_fetched() {
-        assert_eq!(plan_remote(None, Local::Missing, Some("bbb"), 5, false), RemoteAction::Fetch);
+        assert_eq!(
+            plan_remote(None, Local::Missing, Some("bbb"), 5, false),
+            RemoteAction::Fetch
+        );
     }
 
     #[test]
     fn untouched_here_and_changed_there_is_fetched() {
-        let local = Local::File { size: 10, mtime: Some(100) };
-        assert_eq!(plan_remote(Some(E), local, Some("bbb"), 12, false), RemoteAction::Fetch);
+        let local = Local::File {
+            size: 10,
+            mtime: Some(100),
+        };
+        assert_eq!(
+            plan_remote(Some(E), local, Some("bbb"), 12, false),
+            RemoteAction::Fetch
+        );
     }
 
     #[test]
     fn unchanged_remote_leaves_a_local_edit_to_the_upload_scan() {
-        let local = Local::File { size: 11, mtime: Some(200) };
-        assert_eq!(plan_remote(Some(E), local, Some("aaa"), 10, false), RemoteAction::Skip);
+        let local = Local::File {
+            size: 11,
+            mtime: Some(200),
+        };
+        assert_eq!(
+            plan_remote(Some(E), local, Some("aaa"), 10, false),
+            RemoteAction::Skip
+        );
     }
 
     #[test]
     fn changed_on_both_sides_is_a_conflict_after_hashing() {
-        let local = Local::File { size: 11, mtime: Some(200) };
-        assert_eq!(plan_remote(Some(E), local, Some("bbb"), 12, false), RemoteAction::NeedsHash);
-        assert_eq!(after_hash(Some(E), "ccc", Some("bbb")), RemoteAction::Conflict);
+        let local = Local::File {
+            size: 11,
+            mtime: Some(200),
+        };
+        assert_eq!(
+            plan_remote(Some(E), local, Some("bbb"), 12, false),
+            RemoteAction::NeedsHash
+        );
+        assert_eq!(
+            after_hash(Some(E), "ccc", Some("bbb")),
+            RemoteAction::Conflict
+        );
     }
 
     #[test]
@@ -223,17 +277,35 @@ mod tests {
 
     #[test]
     fn an_old_copy_on_a_new_pc_is_a_conflict_not_an_overwrite() {
-        let local = Local::File { size: 9, mtime: Some(50) };
-        assert_eq!(plan_remote(None, local, Some("bbb"), 12, false), RemoteAction::Conflict);
-        let same_size = Local::File { size: 12, mtime: Some(50) };
-        assert_eq!(plan_remote(None, same_size, Some("bbb"), 12, false), RemoteAction::NeedsHash);
+        let local = Local::File {
+            size: 9,
+            mtime: Some(50),
+        };
+        assert_eq!(
+            plan_remote(None, local, Some("bbb"), 12, false),
+            RemoteAction::Conflict
+        );
+        let same_size = Local::File {
+            size: 12,
+            mtime: Some(50),
+        };
+        assert_eq!(
+            plan_remote(None, same_size, Some("bbb"), 12, false),
+            RemoteAction::NeedsHash
+        );
         assert_eq!(after_hash(None, "ccc", Some("bbb")), RemoteAction::Conflict);
     }
 
     #[test]
     fn a_placeholder_is_refreshed_never_a_conflict() {
-        assert_eq!(plan_remote(Some(E), Local::Placeholder, Some("bbb"), 12, false), RemoteAction::RefreshPlaceholder);
-        assert_eq!(plan_remote(Some(E), Local::Placeholder, Some("aaa"), 10, false), RemoteAction::Skip);
+        assert_eq!(
+            plan_remote(Some(E), Local::Placeholder, Some("bbb"), 12, false),
+            RemoteAction::RefreshPlaceholder
+        );
+        assert_eq!(
+            plan_remote(Some(E), Local::Placeholder, Some("aaa"), 10, false),
+            RemoteAction::Skip
+        );
     }
 
     #[test]
@@ -247,20 +319,41 @@ mod tests {
 
     #[test]
     fn a_server_file_without_checksum_never_loops() {
-        let local = Local::File { size: 10, mtime: Some(100) };
-        assert_eq!(plan_remote(Some(E), local, None, 10, false), RemoteAction::Skip);
-        assert_eq!(plan_remote(Some(E), Local::Placeholder, None, 10, false), RemoteAction::Skip);
-        assert_eq!(plan_remote(None, local, None, 10, false), RemoteAction::Index);
-        assert_eq!(plan_remote(None, local, None, 12, false), RemoteAction::Conflict);
+        let local = Local::File {
+            size: 10,
+            mtime: Some(100),
+        };
+        assert_eq!(
+            plan_remote(Some(E), local, None, 10, false),
+            RemoteAction::Skip
+        );
+        assert_eq!(
+            plan_remote(Some(E), Local::Placeholder, None, 10, false),
+            RemoteAction::Skip
+        );
+        assert_eq!(
+            plan_remote(None, local, None, 10, false),
+            RemoteAction::Index
+        );
+        assert_eq!(
+            plan_remote(None, local, None, 12, false),
+            RemoteAction::Conflict
+        );
         assert!(may_upload(Some("aaa"), Some(None)));
         assert!(!may_upload(None, Some(None)));
     }
 
     #[test]
     fn a_kept_copy_gets_the_pc_name() {
-        assert_eq!(kept_name("Face Of Fire.flp", "DESKTOP-1", |_| false), "Face Of Fire (DESKTOP-1).flp");
+        assert_eq!(
+            kept_name("Face Of Fire.flp", "DESKTOP-1", |_| false),
+            "Face Of Fire (DESKTOP-1).flp"
+        );
         let taken = |n: &str| n == "Kick (Laptop).wav";
-        assert_eq!(kept_name("Kick.wav", "Laptop", taken), "Kick (Laptop 2).wav");
+        assert_eq!(
+            kept_name("Kick.wav", "Laptop", taken),
+            "Kick (Laptop 2).wav"
+        );
         assert_eq!(kept_name("README", "", |_| false), "README (this PC)");
         assert_eq!(kept_name("a.wav", "bad:name", |_| false), "a (badname).wav");
     }

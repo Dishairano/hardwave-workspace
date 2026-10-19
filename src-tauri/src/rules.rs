@@ -26,9 +26,17 @@ pub const TEMP_PREFIX: &str = ".hwtmp-";
 /// True when `rel_path` (either separator) is inside an excluded folder or is a
 /// temporary or system file.
 pub fn is_excluded(rel_path: &str) -> bool {
-    let parts: Vec<&str> = rel_path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
-    let Some((name, dirs)) = parts.split_last() else { return false };
-    if dirs.iter().any(|d| EXCLUDED_DIRS.contains(&d.to_ascii_lowercase().as_str())) {
+    let parts: Vec<&str> = rel_path
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let Some((name, dirs)) = parts.split_last() else {
+        return false;
+    };
+    if dirs
+        .iter()
+        .any(|d| EXCLUDED_DIRS.contains(&d.to_ascii_lowercase().as_str()))
+    {
         return true;
     }
     let name = name.to_ascii_lowercase();

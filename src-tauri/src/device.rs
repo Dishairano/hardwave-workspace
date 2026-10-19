@@ -27,7 +27,10 @@ fn valid_id(s: &str) -> bool {
 /// 128 random bits as hex. RandomState is seeded from the operating system's
 /// random source, which is all an install id needs; no extra crate.
 fn random_id() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let mut out = String::with_capacity(33);
     for i in 0..2u64 {
         let mut h = RandomState::new().build_hasher();
@@ -65,11 +68,21 @@ pub fn device_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_default();
     let name: String = raw.chars().filter(|c| !c.is_control()).take(120).collect();
-    if name.trim().is_empty() { "This computer".into() } else { name.trim().to_string() }
+    if name.trim().is_empty() {
+        "This computer".into()
+    } else {
+        name.trim().to_string()
+    }
 }
 
 fn platform() -> &'static str {
-    if cfg!(target_os = "windows") { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" }
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }
 
 fn body(id: &str, status: &SyncStatus) -> serde_json::Value {
@@ -100,7 +113,11 @@ async fn send(token: &str, id: &str, status: &SyncStatus) -> Result<(), String> 
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if res.status().is_success() { Ok(()) } else { Err(format!("heartbeat {}", res.status())) }
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("heartbeat {}", res.status()))
+    }
 }
 
 /// Runs for the life of the app. Signed out or no engine yet: skip the beat.

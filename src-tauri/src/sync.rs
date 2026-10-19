@@ -4,19 +4,19 @@
 //! Workspace API for remote changes. Uses SHA-256 hashes to detect diffs.
 
 use crate::api;
-use futures_util::stream::StreamExt as _;
 use crate::conflicts::{self, Conflict, Indexed, Local, RemoteAction};
-use crate::pins;
 use crate::models::{SyncEntry, SyncStatus};
-use notify::{RecursiveMode, Watcher, Event, EventKind};
-use sha2::{Sha256, Digest};
+use crate::pins;
+use futures_util::stream::StreamExt as _;
+use notify::{Event, EventKind, RecursiveMode, Watcher};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// How often to poll the remote for changes (seconds).
 const POLL_INTERVAL_SECS: u64 = 30;
@@ -63,8 +63,12 @@ fn hash_file(path: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("Read error: {}", e))?;
-        if n == 0 { break; }
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("Read error: {}", e))?;
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
@@ -132,7 +136,9 @@ pub(crate) fn trust_without_hash(
 /// Server timestamps arrive as ISO 8601 in UTC. Anything else is treated as
 /// unknown, which makes `trust_without_hash` refuse rather than guess.
 fn parse_server_time(s: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp())
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp())
 }
 
 #[cfg(test)]
@@ -147,29 +153,65 @@ mod trust_without_hash_tests {
 
     #[test]
     fn unchanged_since_upload_is_trusted() {
-        assert!(trust_without_hash(10, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
+        assert!(trust_without_hash(
+            10,
+            Some(created() - 60),
+            10,
+            Some("ab"),
+            Some(CREATED)
+        ));
     }
 
     #[test]
     fn edited_after_upload_is_not_trusted_even_at_the_same_size() {
-        assert!(!trust_without_hash(10, Some(created() + 60), 10, Some("ab"), Some(CREATED)));
+        assert!(!trust_without_hash(
+            10,
+            Some(created() + 60),
+            10,
+            Some("ab"),
+            Some(CREATED)
+        ));
     }
 
     #[test]
     fn different_size_is_not_trusted() {
-        assert!(!trust_without_hash(11, Some(created() - 60), 10, Some("ab"), Some(CREATED)));
+        assert!(!trust_without_hash(
+            11,
+            Some(created() - 60),
+            10,
+            Some("ab"),
+            Some(CREATED)
+        ));
     }
 
     #[test]
     fn no_server_checksum_is_not_trusted() {
-        assert!(!trust_without_hash(10, Some(created() - 60), 10, None, Some(CREATED)));
-        assert!(!trust_without_hash(10, Some(created() - 60), 10, Some(""), Some(CREATED)));
+        assert!(!trust_without_hash(
+            10,
+            Some(created() - 60),
+            10,
+            None,
+            Some(CREATED)
+        ));
+        assert!(!trust_without_hash(
+            10,
+            Some(created() - 60),
+            10,
+            Some(""),
+            Some(CREATED)
+        ));
     }
 
     #[test]
     fn unknown_times_are_not_trusted() {
         assert!(!trust_without_hash(10, None, 10, Some("ab"), Some(CREATED)));
-        assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), Some("2026-09-01 10:00:00")));
+        assert!(!trust_without_hash(
+            10,
+            Some(0),
+            10,
+            Some("ab"),
+            Some("2026-09-01 10:00:00")
+        ));
         assert!(!trust_without_hash(10, Some(0), 10, Some("ab"), None));
     }
 }
@@ -226,31 +268,52 @@ mod upload_plan_tests {
     use super::*;
     #[test]
     fn untracked_uploads() {
-        assert_eq!(plan_upload(None, None, false, 10, Some(5)), UploadPlan::UploadNew);
+        assert_eq!(
+            plan_upload(None, None, false, 10, Some(5)),
+            UploadPlan::UploadNew
+        );
     }
     #[test]
     fn size_change_uploads() {
-        assert_eq!(plan_upload(Some(9), Some(5), true, 10, Some(5)), UploadPlan::UploadNew);
+        assert_eq!(
+            plan_upload(Some(9), Some(5), true, 10, Some(5)),
+            UploadPlan::UploadNew
+        );
     }
     #[test]
     fn indexed_but_not_uploaded_uploads() {
-        assert_eq!(plan_upload(Some(10), None, false, 10, Some(5)), UploadPlan::UploadNew);
+        assert_eq!(
+            plan_upload(Some(10), None, false, 10, Some(5)),
+            UploadPlan::UploadNew
+        );
     }
     #[test]
     fn same_size_and_mtime_skips() {
-        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(5)), UploadPlan::Skip);
+        assert_eq!(
+            plan_upload(Some(10), Some(5), true, 10, Some(5)),
+            UploadPlan::Skip
+        );
     }
     #[test]
     fn uploaded_no_stored_mtime_trusts() {
-        assert_eq!(plan_upload(Some(10), None, true, 10, Some(5)), UploadPlan::TrustBackfill);
+        assert_eq!(
+            plan_upload(Some(10), None, true, 10, Some(5)),
+            UploadPlan::TrustBackfill
+        );
     }
     #[test]
     fn same_size_diff_mtime_verifies() {
-        assert_eq!(plan_upload(Some(10), Some(5), true, 10, Some(6)), UploadPlan::VerifyByHash);
+        assert_eq!(
+            plan_upload(Some(10), Some(5), true, 10, Some(6)),
+            UploadPlan::VerifyByHash
+        );
     }
     #[test]
     fn same_size_unknown_current_mtime_verifies() {
-        assert_eq!(plan_upload(Some(10), Some(5), true, 10, None), UploadPlan::VerifyByHash);
+        assert_eq!(
+            plan_upload(Some(10), Some(5), true, 10, None),
+            UploadPlan::VerifyByHash
+        );
     }
 }
 
@@ -278,14 +341,19 @@ fn scan_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u
         }
 
         // Skip hidden files and .hardwave-sync metadata
-        if path.file_name()
+        if path
+            .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.starts_with('.'))
             .unwrap_or(false)
         {
             continue;
         }
-        let rel_str = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+        let rel_str = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
         // node_modules, temporary files and the like (rules.rs).
         if crate::rules::is_excluded(&rel_str) {
             continue;
@@ -378,7 +446,11 @@ impl SyncEngine {
 
     async fn note(&self, kind: &'static str, rel_path: &str) {
         let mut r = self.recent.lock().await;
-        r.push_front(Activity { kind, rel_path: rel_path.to_string(), at: chrono::Utc::now().to_rfc3339() });
+        r.push_front(Activity {
+            kind,
+            rel_path: rel_path.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
         r.truncate(20);
     }
 
@@ -391,7 +463,9 @@ impl SyncEngine {
         // Abort any existing SSE connections (token changed or logged out)
         {
             let mut handles = self.sse_handles.lock().await;
-            for h in handles.drain(..) { h.abort(); }
+            for h in handles.drain(..) {
+                h.abort();
+            }
         }
 
         let is_new = token.is_some();
@@ -412,9 +486,8 @@ impl SyncEngine {
                         log::info!("[Sync] Created workspace folder: {}", ws_dir.display());
                         if let Ok(folders) = api::list_folders(&t, &ws.id).await {
                             for f in &folders {
-                                let folder_path = f.path.as_deref()
-                                    .unwrap_or(&f.name)
-                                    .trim_matches('/');
+                                let folder_path =
+                                    f.path.as_deref().unwrap_or(&f.name).trim_matches('/');
                                 if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                                     let dir = ws_dir.join(folder_path);
                                     let _ = std::fs::create_dir_all(&dir);
@@ -492,7 +565,10 @@ impl SyncEngine {
     fn scan_disk_totals(own: Option<&[String]>) -> (u32, u64) {
         let root = sync_root();
         let files = match own {
-            Some(names) => names.iter().flat_map(|n| scan_local(&root.join(n))).collect(),
+            Some(names) => names
+                .iter()
+                .flat_map(|n| scan_local(&root.join(n)))
+                .collect(),
             None => scan_local(&root),
         };
         let bytes: u64 = files.iter().map(|(_, _, s)| *s).sum();
@@ -509,11 +585,15 @@ impl SyncEngine {
     /// Push per-file sync progress to the webview via safe eval.
     fn emit_file_progress(&self, rel_path: &str, direction: &str, percent: u32) {
         if let Some(win) = self.app.get_webview_window("main") {
-            crate::safe_eval(&win, "__HW_SYNC_FILE__", &serde_json::json!({
-                "rel_path": rel_path,
-                "direction": direction,
-                "percent": percent,
-            }));
+            crate::safe_eval(
+                &win,
+                "__HW_SYNC_FILE__",
+                &serde_json::json!({
+                    "rel_path": rel_path,
+                    "direction": direction,
+                    "percent": percent,
+                }),
+            );
         }
     }
 
@@ -526,7 +606,9 @@ impl SyncEngine {
             }
             log::info!(
                 "[Sync] Conflict: '{}' changed here ({} bytes) and in Workspace ({} bytes)",
-                c.rel_path, c.local_size, c.remote_size
+                c.rel_path,
+                c.local_size,
+                c.remote_size
             );
             all.insert(c.rel_path.clone(), c.clone());
             conflicts::save(&all);
@@ -546,7 +628,11 @@ impl SyncEngine {
     /// Settle one conflict the way the producer chose. Nothing is thrown away:
     /// Workspace keeps every earlier version, and a copy of this PC's file
     /// that is replaced goes to the Recycle Bin.
-    pub async fn resolve_conflict(&self, rel_path: &str, choice: conflicts::Choice) -> Result<String, String> {
+    pub async fn resolve_conflict(
+        &self,
+        rel_path: &str,
+        choice: conflicts::Choice,
+    ) -> Result<String, String> {
         let token = self.token.read().await.clone().ok_or("Sign in first.")?;
         let c = self
             .conflicts
@@ -567,21 +653,35 @@ impl SyncEngine {
                     trash::delete(&path)
                         .map_err(|e| format!("This PC's copy could not go to the Recycle Bin, so nothing changed: {e}"))?;
                 }
-                let entry = self.download_replace(&token, &c.workspace_id, &c.remote_id, rel_path).await?;
+                let entry = self
+                    .download_replace(&token, &c.workspace_id, &c.remote_id, rel_path)
+                    .await?;
                 self.index_put(entry).await;
-                "Workspace's version is on this PC. This PC's copy is in the Recycle Bin.".to_string()
+                "Workspace's version is on this PC. This PC's copy is in the Recycle Bin."
+                    .to_string()
             }
             conflicts::Choice::Both => {
-                let dir = path.parent().ok_or("The file has no folder.")?.to_path_buf();
-                let name = path.file_name().and_then(|n| n.to_str()).ok_or("The file name cannot be read.")?;
-                let kept = conflicts::kept_name(name, &crate::device::device_name(), |n| dir.join(n).exists());
+                let dir = path
+                    .parent()
+                    .ok_or("The file has no folder.")?
+                    .to_path_buf();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or("The file name cannot be read.")?;
+                let kept = conflicts::kept_name(name, &crate::device::device_name(), |n| {
+                    dir.join(n).exists()
+                });
                 // An earlier try may have renamed it already and then failed to
                 // download; then only the download is left to do.
                 if path.exists() {
-                    std::fs::rename(&path, dir.join(&kept))
-                        .map_err(|e| format!("This PC's copy could not be renamed (is it open?): {e}"))?;
+                    std::fs::rename(&path, dir.join(&kept)).map_err(|e| {
+                        format!("This PC's copy could not be renamed (is it open?): {e}")
+                    })?;
                 }
-                let entry = self.download_replace(&token, &c.workspace_id, &c.remote_id, rel_path).await?;
+                let entry = self
+                    .download_replace(&token, &c.workspace_id, &c.remote_id, rel_path)
+                    .await?;
                 self.index_put(entry).await;
                 // The renamed copy is a new file; the next pass uploads it.
                 format!("Both kept. This PC's copy is now \"{kept}\".")
@@ -612,9 +712,11 @@ impl SyncEngine {
         }
         let modes = self.modes.lock().await.clone();
         let own = self.own_workspaces.read().await.clone();
-        let overview = tokio::task::spawn_blocking(move || build_overview(&sync_root(), &modes, own.as_deref()))
-            .await
-            .unwrap_or_default();
+        let overview = tokio::task::spawn_blocking(move || {
+            build_overview(&sync_root(), &modes, own.as_deref())
+        })
+        .await
+        .unwrap_or_default();
         *self.overview_cache.lock().await = Some((std::time::Instant::now(), overview.clone()));
         overview
     }
@@ -622,7 +724,11 @@ impl SyncEngine {
     /// Apply the producer's choice for a folder. The pin state is set at once;
     /// bringing bytes in ("always") or freeing them ("online only") runs in the
     /// background and can take a while on a big folder.
-    pub async fn set_folder_mode(self: &Arc<Self>, folder: &str, mode: pins::Mode) -> Result<String, String> {
+    pub async fn set_folder_mode(
+        self: &Arc<Self>,
+        folder: &str,
+        mode: pins::Mode,
+    ) -> Result<String, String> {
         if !is_safe_rel_path(folder) {
             return Err("That folder name cannot be used.".into());
         }
@@ -646,11 +752,15 @@ impl SyncEngine {
             pins::Mode::Always => {
                 let engine = Arc::clone(self);
                 tokio::spawn(async move {
-                    let (n, failed) = tokio::task::spawn_blocking(move || hydrate_tree(&path)).await.unwrap_or((0, 0));
+                    let (n, failed) = tokio::task::spawn_blocking(move || hydrate_tree(&path))
+                        .await
+                        .unwrap_or((0, 0));
                     log::warn!("[Pins] brought {n} files onto this PC, {failed} failed");
                     *engine.overview_cache.lock().await = None;
                 });
-                Ok(format!("{name} stays on this PC. Files that were online only are coming down now."))
+                Ok(format!(
+                    "{name} stays on this PC. Files that were online only are coming down now."
+                ))
             }
             pins::Mode::Online => {
                 let engine = Arc::clone(self);
@@ -664,7 +774,9 @@ impl SyncEngine {
                 });
                 Ok(format!("{name} is online only. Files that are backed up are being freed now; anything not yet uploaded stays."))
             }
-            pins::Mode::WhenOpened => Ok(format!("{name}: files come down when you open them and stay until you free up space.")),
+            pins::Mode::WhenOpened => Ok(format!(
+                "{name}: files come down when you open them and stay until you free up space."
+            )),
         }
     }
 
@@ -676,7 +788,10 @@ impl SyncEngine {
         let rel = {
             let idx = self.index.lock().await;
             idx.values()
-                .find(|e| e.remote_id.as_deref() == Some(file_id) && e.workspace_id.as_deref() == Some(ws_id))
+                .find(|e| {
+                    e.remote_id.as_deref() == Some(file_id)
+                        && e.workspace_id.as_deref() == Some(ws_id)
+                })
                 .map(|e| e.rel_path.clone())
         };
         if let Some(rel) = rel {
@@ -690,7 +805,12 @@ impl SyncEngine {
     }
 
     /// Download a file that is not in the sync folder, for dragging.
-    pub async fn cache_for_drag(&self, ws_id: &str, file_id: &str, name: &str) -> Result<PathBuf, String> {
+    pub async fn cache_for_drag(
+        &self,
+        ws_id: &str,
+        file_id: &str,
+        name: &str,
+    ) -> Result<PathBuf, String> {
         let token = self.token.read().await.clone().ok_or("Sign in first.")?;
         let dest = drag_cache_path(file_id, name);
         let dir = dest.parent().ok_or("no folder")?;
@@ -712,7 +832,13 @@ impl SyncEngine {
     /// interrupted download never leaves half a project where the whole one
     /// was, and a 2 GB recording never sits in memory (the old download read
     /// the whole body into memory and wrote straight over the file).
-    async fn download_replace(&self, token: &str, ws_id: &str, file_id: &str, rel_path: &str) -> Result<SyncEntry, String> {
+    async fn download_replace(
+        &self,
+        token: &str,
+        ws_id: &str,
+        file_id: &str,
+        rel_path: &str,
+    ) -> Result<SyncEntry, String> {
         if !is_safe_rel_path(rel_path) {
             return Err(format!("unsafe path {rel_path}"));
         }
@@ -724,7 +850,10 @@ impl SyncEngine {
         let before = stamp(&dest);
         let dir = dest.parent().ok_or("no folder")?.to_path_buf();
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let name = dest.file_name().and_then(|n| n.to_str()).ok_or("bad file name")?;
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("bad file name")?;
         let tmp = dir.join(format!("{}{}", crate::rules::TEMP_PREFIX, name));
 
         self.emit_file_progress(rel_path, "download", 0);
@@ -734,9 +863,14 @@ impl SyncEngine {
                 Ok((sha, size)) => {
                     if stamp(&dest) != before {
                         let _ = std::fs::remove_file(&tmp);
-                        return Err(format!("{rel_path} changed on this PC during the download; left as it is"));
+                        return Err(format!(
+                            "{rel_path} changed on this PC during the download; left as it is"
+                        ));
                     }
-                    self.self_writes.lock().await.insert(rel_path.to_string(), sha.clone());
+                    self.self_writes
+                        .lock()
+                        .await
+                        .insert(rel_path.to_string(), sha.clone());
                     if let Err(e) = std::fs::rename(&tmp, &dest) {
                         let _ = std::fs::remove_file(&tmp);
                         self.self_writes.lock().await.remove(rel_path);
@@ -780,76 +914,86 @@ impl SyncEngine {
                 Ok(()) => {
                     let token = Arc::clone(&self.token);
                     let stale_trigger = Arc::clone(&self.sse_trigger);
-                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(move |identity: String, offset: u64, length: u64, file_size: u64| {
-                        let token = Arc::clone(&token);
-                        let stale_trigger = Arc::clone(&stale_trigger);
-                        Box::pin(async move {
-                            // identity is "workspaceId/fileId", set when the
-                            // placeholder was created.
-                            let (ws_id, file_id) = identity
-                                .split_once('/')
-                                .ok_or_else(|| format!("bad file identity: {identity}"))?;
-                            let tok = token.read().await.clone()
-                                .ok_or_else(|| "not signed in".to_string())?;
-                            let url = api::get_download_url(&tok, ws_id, file_id).await?;
+                    let fetcher: crate::hydration::Fetcher = std::sync::Arc::new(
+                        move |identity: String, offset: u64, length: u64, file_size: u64| {
+                            let token = Arc::clone(&token);
+                            let stale_trigger = Arc::clone(&stale_trigger);
+                            Box::pin(async move {
+                                // identity is "workspaceId/fileId", set when the
+                                // placeholder was created.
+                                let (ws_id, file_id) = identity
+                                    .split_once('/')
+                                    .ok_or_else(|| format!("bad file identity: {identity}"))?;
+                                let tok = token
+                                    .read()
+                                    .await
+                                    .clone()
+                                    .ok_or_else(|| "not signed in".to_string())?;
+                                let url = api::get_download_url(&tok, ws_id, file_id).await?;
 
-                            // Ask object storage for just the slice Windows
-                            // wants, so opening one sample does not pull a
-                            // whole pack. Not every backend honours Range, so
-                            // fall back to a whole-object GET rather than
-                            // failing the hydration.
-                            let end = offset + length.saturating_sub(1);
-                            let ranged = api::http_client()
-                                .get(&url)
-                                .header("Range", format!("bytes={}-{}", offset, end))
-                                .send().await
-                                .map_err(|e| format!("hydrate request failed: {e}"))?;
+                                // Ask object storage for just the slice Windows
+                                // wants, so opening one sample does not pull a
+                                // whole pack. Not every backend honours Range, so
+                                // fall back to a whole-object GET rather than
+                                // failing the hydration.
+                                let end = offset + length.saturating_sub(1);
+                                let ranged = api::http_client()
+                                    .get(&url)
+                                    .header("Range", format!("bytes={}-{}", offset, end))
+                                    .send()
+                                    .await
+                                    .map_err(|e| format!("hydrate request failed: {e}"))?;
 
-                            // The placeholder describes one version of the file;
-                            // Workspace serves the newest. When the sizes differ
-                            // the file changed on another PC and this placeholder
-                            // is stale: serving the new bytes cut to the old size
-                            // gave a corrupt file (Windows test, 2026-10-09).
-                            // Refuse, so the opening program gets an error, and
-                            // run a sync pass, which refreshes the placeholder.
-                            let stale = |total: u64| -> Result<(), String> {
-                                if file_size > 0 && total != file_size {
-                                    stale_trigger.notify_one();
-                                    return Err(format!(
+                                // The placeholder describes one version of the file;
+                                // Workspace serves the newest. When the sizes differ
+                                // the file changed on another PC and this placeholder
+                                // is stale: serving the new bytes cut to the old size
+                                // gave a corrupt file (Windows test, 2026-10-09).
+                                // Refuse, so the opening program gets an error, and
+                                // run a sync pass, which refreshes the placeholder.
+                                let stale = |total: u64| -> Result<(), String> {
+                                    if file_size > 0 && total != file_size {
+                                        stale_trigger.notify_one();
+                                        return Err(format!(
                                         "{identity} changed in Workspace ({total} bytes now, {file_size} here); the placeholder is refreshed on the next pass"
                                     ));
+                                    }
+                                    Ok(())
+                                };
+                                let status = ranged.status();
+                                if status.as_u16() == 206 {
+                                    // "bytes 0-1023/52998": the number after / is the whole object.
+                                    let total = ranged
+                                        .headers()
+                                        .get(reqwest::header::CONTENT_RANGE)
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|v| v.rsplit('/').next())
+                                        .and_then(|v| v.trim().parse::<u64>().ok());
+                                    if let Some(total) = total {
+                                        stale(total)?;
+                                    }
+                                    let b = ranged
+                                        .bytes()
+                                        .await
+                                        .map_err(|e| format!("hydrate body failed: {e}"))?;
+                                    return Ok(b.to_vec());
                                 }
-                                Ok(())
-                            };
-                            let status = ranged.status();
-                            if status.as_u16() == 206 {
-                                // "bytes 0-1023/52998": the number after / is the whole object.
-                                let total = ranged
-                                    .headers()
-                                    .get(reqwest::header::CONTENT_RANGE)
-                                    .and_then(|v| v.to_str().ok())
-                                    .and_then(|v| v.rsplit('/').next())
-                                    .and_then(|v| v.trim().parse::<u64>().ok());
-                                if let Some(total) = total {
-                                    stale(total)?;
+                                if !status.is_success() {
+                                    return Err(format!("hydrate HTTP {status}"));
                                 }
-                                let b = ranged.bytes().await
+                                // 200 means the whole object came back; take the
+                                // window Windows actually asked for.
+                                let all = ranged
+                                    .bytes()
+                                    .await
                                     .map_err(|e| format!("hydrate body failed: {e}"))?;
-                                return Ok(b.to_vec());
-                            }
-                            if !status.is_success() {
-                                return Err(format!("hydrate HTTP {status}"));
-                            }
-                            // 200 means the whole object came back; take the
-                            // window Windows actually asked for.
-                            let all = ranged.bytes().await
-                                .map_err(|e| format!("hydrate body failed: {e}"))?;
-                            stale(all.len() as u64)?;
-                            let start = (offset as usize).min(all.len());
-                            let stop = (start + length as usize).min(all.len());
-                            Ok(all[start..stop].to_vec())
-                        })
-                    });
+                                stale(all.len() as u64)?;
+                                let start = (offset as usize).min(all.len());
+                                let stop = (start + length as usize).min(all.len());
+                                Ok(all[start..stop].to_vec())
+                            })
+                        },
+                    );
 
                     match crate::hydration::connect(&root, fetcher) {
                         Ok(conn) => {
@@ -862,10 +1006,14 @@ impl SyncEngine {
                                 std::sync::OnceLock::new();
                             let _ = HYDRATION.set(conn);
                         }
-                        Err(e) => log::warn!("[Sync] hydration connect failed: {e} — falling back to full downloads"),
+                        Err(e) => log::warn!(
+                            "[Sync] hydration connect failed: {e} — falling back to full downloads"
+                        ),
                     }
                 }
-                Err(e) => log::warn!("[Sync] sync-root registration failed: {e} — falling back to full downloads"),
+                Err(e) => log::warn!(
+                    "[Sync] sync-root registration failed: {e} — falling back to full downloads"
+                ),
             }
         }
 
@@ -898,7 +1046,11 @@ impl SyncEngine {
                 }
             };
             if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                log::warn!("[Sync] Failed to start watching '{}': {}", root.display(), e);
+                log::warn!(
+                    "[Sync] Failed to start watching '{}': {}",
+                    root.display(),
+                    e
+                );
                 return;
             }
             // Keep the watcher alive
@@ -987,7 +1139,11 @@ impl SyncEngine {
             let index = self.index.lock().await;
             match index.get(rel_path) {
                 Some(entry) if entry.sha256 == sha => return Ok(()),
-                Some(entry) => Some((entry.sha256.clone(), entry.remote_id.clone(), entry.workspace_id.clone())),
+                Some(entry) => Some((
+                    entry.sha256.clone(),
+                    entry.remote_id.clone(),
+                    entry.workspace_id.clone(),
+                )),
                 None => None,
             }
         };
@@ -1021,7 +1177,8 @@ impl SyncEngine {
                             remote_sha: remote_sha.unwrap_or_default(),
                             remote_updated_at: remote.updated_at.clone(),
                             detected_at: chrono::Utc::now().to_rfc3339(),
-                        }).await;
+                        })
+                        .await;
                         return Ok(());
                     }
                 }
@@ -1046,10 +1203,12 @@ impl SyncEngine {
             None => return Ok(()),
         };
 
-        let filename = full_path.file_name()
+        let filename = full_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
-        let folder = Path::new(file_path_in_ws).parent()
+        let folder = Path::new(file_path_in_ws)
+            .parent()
             .and_then(|p| p.to_str())
             .filter(|s| !s.is_empty());
 
@@ -1058,26 +1217,39 @@ impl SyncEngine {
 
         // Upload with retry (no index lock held)
         let file_size = meta.len();
-        let upload = api::with_retry({
-            let token = token.clone();
-            let ws_id = ws_id.clone();
-            let filename = filename.to_string();
-            let folder = folder.map(|s| s.to_string());
-            let sha = sha.clone();
-            let full_path = full_path.clone();
-            move || {
+        let upload = api::with_retry(
+            {
                 let token = token.clone();
                 let ws_id = ws_id.clone();
-                let filename = filename.clone();
-                let folder = folder.clone();
+                let filename = filename.to_string();
+                let folder = folder.map(|s| s.to_string());
                 let sha = sha.clone();
                 let full_path = full_path.clone();
-                Box::pin(async move {
-                    let file_id = api::upload_file(&token, &ws_id, &filename, file_size, folder.as_deref(), &sha, &full_path).await?;
-                    Ok::<_, String>((file_id, ws_id))
-                })
-            }
-        }, 2).await?;
+                move || {
+                    let token = token.clone();
+                    let ws_id = ws_id.clone();
+                    let filename = filename.clone();
+                    let folder = folder.clone();
+                    let sha = sha.clone();
+                    let full_path = full_path.clone();
+                    Box::pin(async move {
+                        let file_id = api::upload_file(
+                            &token,
+                            &ws_id,
+                            &filename,
+                            file_size,
+                            folder.as_deref(),
+                            &sha,
+                            &full_path,
+                        )
+                        .await?;
+                        Ok::<_, String>((file_id, ws_id))
+                    })
+                }
+            },
+            2,
+        )
+        .await?;
 
         self.emit_file_progress(rel_path, "upload", 100);
         self.note("up", rel_path).await;
@@ -1085,16 +1257,19 @@ impl SyncEngine {
         // Update index (brief lock)
         {
             let mut index = self.index.lock().await;
-            index.insert(rel_path.to_string(), SyncEntry {
-                rel_path: rel_path.to_string(),
-                sha256: sha,
-                modified: chrono::Utc::now().to_rfc3339(),
-                size: meta.len(),
-                remote_id: Some(upload.0),
-                workspace_id: Some(upload.1),
-                mtime: file_mtime(&full_path),
-                verified: true,
-            });
+            index.insert(
+                rel_path.to_string(),
+                SyncEntry {
+                    rel_path: rel_path.to_string(),
+                    sha256: sha,
+                    modified: chrono::Utc::now().to_rfc3339(),
+                    size: meta.len(),
+                    remote_id: Some(upload.0),
+                    workspace_id: Some(upload.1),
+                    mtime: file_mtime(&full_path),
+                    verified: true,
+                },
+            );
             write_index(&index);
         }
 
@@ -1140,7 +1315,11 @@ impl SyncEngine {
         let root = sync_root();
         let workspaces = api::list_workspaces(token).await?;
         log::info!("[Sync] Full sync: {} workspace(s)", workspaces.len());
-        let own: Vec<String> = workspaces.iter().filter(|w| is_safe_component(&w.name)).map(|w| w.name.clone()).collect();
+        let own: Vec<String> = workspaces
+            .iter()
+            .filter(|w| is_safe_component(&w.name))
+            .map(|w| w.name.clone())
+            .collect();
         let changed = self.own_workspaces.read().await.as_ref() != Some(&own);
         if changed {
             *self.own_workspaces.write().await = Some(own);
@@ -1158,9 +1337,7 @@ impl SyncEngine {
 
             if let Ok(folders) = api::list_folders(token, &ws.id).await {
                 for f in &folders {
-                    let folder_path = f.path.as_deref()
-                        .unwrap_or(&f.name)
-                        .trim_matches('/');
+                    let folder_path = f.path.as_deref().unwrap_or(&f.name).trim_matches('/');
                     if !folder_path.is_empty() && is_safe_rel_path(folder_path) {
                         let _ = std::fs::create_dir_all(ws_dir.join(folder_path));
                     }
@@ -1226,16 +1403,32 @@ impl SyncEngine {
             chosen.sort_unstable();
             let to_download: Vec<(String, api::WorkspaceFile, Remembered)> = {
                 let idx = self.index.lock().await;
-                chosen.iter().map(|&i| &remote_files[i]).filter_map(|rf| {
-                    let rel_path = rel_of(rf);
-                    remote_sha_by_rel.insert(rel_path.clone(), rf.sha256.clone().filter(|h| !h.is_empty()));
-                    let entry = idx.get(&rel_path);
-                    let should = match entry {
-                        Some(e) => rf.sha256.as_deref().is_some_and(|h| !h.is_empty() && h != e.sha256),
-                        None => true,
-                    };
-                    should.then(|| (rel_path, rf.clone(), entry.map(|e| (e.sha256.clone(), e.size, e.mtime))))
-                }).collect()
+                chosen
+                    .iter()
+                    .map(|&i| &remote_files[i])
+                    .filter_map(|rf| {
+                        let rel_path = rel_of(rf);
+                        remote_sha_by_rel.insert(
+                            rel_path.clone(),
+                            rf.sha256.clone().filter(|h| !h.is_empty()),
+                        );
+                        let entry = idx.get(&rel_path);
+                        let should = match entry {
+                            Some(e) => rf
+                                .sha256
+                                .as_deref()
+                                .is_some_and(|h| !h.is_empty() && h != e.sha256),
+                            None => true,
+                        };
+                        should.then(|| {
+                            (
+                                rel_path,
+                                rf.clone(),
+                                entry.map(|e| (e.sha256.clone(), e.size, e.mtime)),
+                            )
+                        })
+                    })
+                    .collect()
             };
 
             // Process downloads without holding the index lock.
@@ -1280,7 +1473,11 @@ impl SyncEngine {
                         mtime: file_mtime(&local_path),
                     }
                 };
-                let indexed = remembered.as_ref().map(|(sha, size, mtime)| Indexed { sha, size: *size, mtime: *mtime });
+                let indexed = remembered.as_ref().map(|(sha, size, mtime)| Indexed {
+                    sha,
+                    size: *size,
+                    mtime: *mtime,
+                });
                 let trusted = match local {
                     Local::File { size, mtime } => trust_without_hash(
                         size,
@@ -1291,7 +1488,8 @@ impl SyncEngine {
                     ),
                     _ => false,
                 };
-                let mut action = conflicts::plan_remote(indexed, local, rf.sha256.as_deref(), rf.size, trusted);
+                let mut action =
+                    conflicts::plan_remote(indexed, local, rf.sha256.as_deref(), rf.size, trusted);
                 let mut hashed = false;
                 if action == RemoteAction::NeedsHash {
                     action = match hash_file(&local_path) {
@@ -1307,7 +1505,9 @@ impl SyncEngine {
                 match action {
                     RemoteAction::Skip | RemoteAction::NeedsHash => continue,
                     RemoteAction::Index => {
-                        let Local::File { size, mtime } = local else { continue };
+                        let Local::File { size, mtime } = local else {
+                            continue;
+                        };
                         let entry = SyncEntry {
                             rel_path: rel_path.clone(),
                             sha256: rf.sha256.clone().unwrap_or_default(),
@@ -1324,7 +1524,9 @@ impl SyncEngine {
                         continue;
                     }
                     RemoteAction::Conflict => {
-                        let Local::File { size, mtime } = local else { continue };
+                        let Local::File { size, mtime } = local else {
+                            continue;
+                        };
                         self.add_conflict(Conflict {
                             rel_path: rel_path.clone(),
                             workspace_id: ws.id.clone(),
@@ -1335,12 +1537,15 @@ impl SyncEngine {
                             remote_sha: rf.sha256.clone().unwrap_or_default(),
                             remote_updated_at: rf.updated_at.clone(),
                             detected_at: chrono::Utc::now().to_rfc3339(),
-                        }).await;
+                        })
+                        .await;
                         continue;
                     }
                     RemoteAction::RefreshPlaceholder => {
                         let identity = format!("{}/{}", ws.id, rf.id);
-                        match crate::cloudfiles::refresh_placeholder(&root, rel_path, rf.size, &identity) {
+                        match crate::cloudfiles::refresh_placeholder(
+                            &root, rel_path, rf.size, &identity,
+                        ) {
                             Ok(()) => {
                                 let entry = SyncEntry {
                                     rel_path: rel_path.clone(),
@@ -1356,7 +1561,11 @@ impl SyncEngine {
                                 downloaded.push(entry);
                                 self.emit_file_progress(rel_path, "placeholder", 100);
                             }
-                            Err(e) => log::warn!("[Sync] Placeholder refresh failed for '{}': {}", rel_path, e),
+                            Err(e) => log::warn!(
+                                "[Sync] Placeholder refresh failed for '{}': {}",
+                                rel_path,
+                                e
+                            ),
                         }
                         continue;
                     }
@@ -1369,7 +1578,9 @@ impl SyncEngine {
                                     pending_flush.push(entry.clone());
                                     downloaded.push(entry);
                                 }
-                                Err(e) => log::warn!("[Sync] Update failed for '{}': {}", rel_path, e),
+                                Err(e) => {
+                                    log::warn!("[Sync] Update failed for '{}': {}", rel_path, e)
+                                }
                             }
                             continue;
                         }
@@ -1387,7 +1598,8 @@ impl SyncEngine {
                 // actually opens it. Falls through to a real download when the
                 // platform does not support it (non-Windows, or pre-1709).
                 // A folder kept "always on this PC" gets the bytes, not a placeholder.
-                let always = pins::mode_for(rel_path, &*self.modes.lock().await) == pins::Mode::Always;
+                let always =
+                    pins::mode_for(rel_path, &*self.modes.lock().await) == pins::Mode::Always;
                 if crate::cloudfiles::is_supported() && !always {
                     let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
                     let ph = crate::cloudfiles::RemoteFile {
@@ -1419,7 +1631,11 @@ impl SyncEngine {
                             continue;
                         }
                         Ok(_) => log::info!("[Sync] Placeholder skipped for '{}'", rel_path),
-                        Err(e) => log::warn!("[Sync] Placeholder failed for '{}': {} — downloading instead", rel_path, e),
+                        Err(e) => log::warn!(
+                            "[Sync] Placeholder failed for '{}': {} — downloading instead",
+                            rel_path,
+                            e
+                        ),
                     }
                 }
 
@@ -1450,7 +1666,12 @@ impl SyncEngine {
             let idx_snapshot: HashMap<String, (u64, String, Option<i64>, bool)> = {
                 let idx = self.index.lock().await;
                 idx.iter()
-                    .map(|(k, e)| (k.clone(), (e.size, e.sha256.clone(), e.mtime, e.remote_id.is_some())))
+                    .map(|(k, e)| {
+                        (
+                            k.clone(),
+                            (e.size, e.sha256.clone(), e.mtime, e.remote_id.is_some()),
+                        )
+                    })
                     .collect()
             };
 
@@ -1461,7 +1682,8 @@ impl SyncEngine {
             // only when we already had to hash to confirm a real edit.
             let mut to_upload: Vec<(String, PathBuf, u64, Option<String>)> = Vec::new();
             let mut backfill_mtime: Vec<(String, i64)> = Vec::new();
-            let waiting: std::collections::HashSet<String> = self.conflicts.lock().await.keys().cloned().collect();
+            let waiting: std::collections::HashSet<String> =
+                self.conflicts.lock().await.keys().cloned().collect();
             for (local_rel, local_path, size) in &local_files {
                 let full_rel = format!("{}/{}", ws.name, local_rel);
                 let indexed = idx_snapshot.get(&full_rel);
@@ -1477,7 +1699,13 @@ impl SyncEngine {
                 }
                 let mtime = file_mtime(local_path);
                 let uploaded = indexed.map(|e| e.3).unwrap_or(false);
-                match plan_upload(indexed.map(|e| e.0), indexed.and_then(|e| e.2), uploaded, *size, mtime) {
+                match plan_upload(
+                    indexed.map(|e| e.0),
+                    indexed.and_then(|e| e.2),
+                    uploaded,
+                    *size,
+                    mtime,
+                ) {
                     UploadPlan::Skip => {}
                     // Already uploaded, just never tagged: record its mtime, no
                     // hash, no re-upload (and no placeholder hydration).
@@ -1535,13 +1763,16 @@ impl SyncEngine {
                     let ws_name = ws.name.clone();
 
                     async move {
-                        let rel_in_ws = full_rel.strip_prefix(&format!("{}/", ws_name))
+                        let rel_in_ws = full_rel
+                            .strip_prefix(&format!("{}/", ws_name))
                             .unwrap_or(&full_rel);
-                        let filename = local_path.file_name()
+                        let filename = local_path
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("unknown")
                             .to_string();
-                        let folder = Path::new(rel_in_ws).parent()
+                        let folder = Path::new(rel_in_ws)
+                            .parent()
                             .and_then(|p| p.to_str())
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
@@ -1561,33 +1792,56 @@ impl SyncEngine {
                             }
                         };
 
-                        let upload = api::with_retry({
-                            let token = token.clone();
-                            let ws_id = ws_id.clone();
-                            let filename = filename.clone();
-                            let folder = folder.clone();
-                            let sha = sha.clone();
-                            let local_path = local_path.clone();
-                            move || {
+                        let upload = api::with_retry(
+                            {
                                 let token = token.clone();
                                 let ws_id = ws_id.clone();
                                 let filename = filename.clone();
                                 let folder = folder.clone();
                                 let sha = sha.clone();
                                 let local_path = local_path.clone();
-                                let full_rel = full_rel.clone();
-                                Box::pin(async move {
-                                    let file_id = api::upload_file(&token, &ws_id, &filename, size, folder.as_deref(), &sha, &local_path).await?;
-                                    Ok::<_, String>((full_rel.clone(), sha.clone(), size, file_id, ws_id.clone()))
-                                })
-                            }
-                        }, 2).await?;
+                                move || {
+                                    let token = token.clone();
+                                    let ws_id = ws_id.clone();
+                                    let filename = filename.clone();
+                                    let folder = folder.clone();
+                                    let sha = sha.clone();
+                                    let local_path = local_path.clone();
+                                    let full_rel = full_rel.clone();
+                                    Box::pin(async move {
+                                        let file_id = api::upload_file(
+                                            &token,
+                                            &ws_id,
+                                            &filename,
+                                            size,
+                                            folder.as_deref(),
+                                            &sha,
+                                            &local_path,
+                                        )
+                                        .await?;
+                                        Ok::<_, String>((
+                                            full_rel.clone(),
+                                            sha.clone(),
+                                            size,
+                                            file_id,
+                                            ws_id.clone(),
+                                        ))
+                                    })
+                                }
+                            },
+                            2,
+                        )
+                        .await?;
                         let (fr, sh, sz, fid, wid) = upload;
                         Ok::<_, String>((fr, sh, sz, fid, wid, entry_mtime))
                     }
                 },
             ))
-            .buffer_unordered(self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN));
+            .buffer_unordered(
+                self.upload_parallel
+                    .load(Ordering::Relaxed)
+                    .max(UPLOAD_PARALLEL_MIN),
+            );
 
             futures_util::pin_mut!(uploads);
             // Outcomes of this pass, so the width can follow the line (see below).
@@ -1643,7 +1897,11 @@ impl SyncEngine {
                 let _ = self.app.emit("sync:status", self.get_status().await);
             }
             if uploaded_count > 0 {
-                log::info!("[Sync] Uploaded {} file(s) in '{}'", uploaded_count, ws.name);
+                log::info!(
+                    "[Sync] Uploaded {} file(s) in '{}'",
+                    uploaded_count,
+                    ws.name
+                );
             }
 
             // Follow the line. Most uploads failing means the path to storage is
@@ -1652,7 +1910,10 @@ impl SyncEngine {
             // are clamped, and a pass that tried nothing changes nothing.
             let tried = pass_ok + pass_failed;
             if tried > 0 {
-                let width = self.upload_parallel.load(Ordering::Relaxed).max(UPLOAD_PARALLEL_MIN);
+                let width = self
+                    .upload_parallel
+                    .load(Ordering::Relaxed)
+                    .max(UPLOAD_PARALLEL_MIN);
                 let next = if pass_failed * 2 > tried {
                     (width / 2).max(UPLOAD_PARALLEL_MIN)
                 } else if pass_failed * 10 <= tried {
@@ -1663,7 +1924,11 @@ impl SyncEngine {
                 if next != width {
                     log::info!(
                         "[Sync] {}/{} uploads failed in '{}': {} at a time -> {}",
-                        pass_failed, tried, ws.name, width, next
+                        pass_failed,
+                        tried,
+                        ws.name,
+                        width,
+                        next
                     );
                     self.upload_parallel.store(next, Ordering::Relaxed);
                 }
@@ -1702,16 +1967,26 @@ impl SyncEngine {
                     Err(e) => {
                         log::warn!("[SSE] Connect error: {}", redact_token(&e.to_string()));
                     }
-                    Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                        || resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                        log::warn!("[SSE] Auth error {}: stopping SSE for workspace {}", resp.status(), workspace_id);
+                    Ok(resp)
+                        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                            || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+                    {
+                        log::warn!(
+                            "[SSE] Auth error {}: stopping SSE for workspace {}",
+                            resp.status(),
+                            workspace_id
+                        );
                         return; // 401/403: the token is gone, retrying will not help
                     }
                     Ok(resp) if !resp.status().is_success() => {
                         // Maintenance (503) or a server error: keep trying with backoff.
                         // This used to stop the stream for good, so live updates only
                         // came back after the app was restarted.
-                        log::info!("[SSE] Server answered {} for workspace {}; retrying", resp.status(), workspace_id);
+                        log::info!(
+                            "[SSE] Server answered {} for workspace {}; retrying",
+                            resp.status(),
+                            workspace_id
+                        );
                     }
                     Ok(resp) => {
                         backoff_ms = 2_000; // reset on successful connect
@@ -1726,9 +2001,13 @@ impl SyncEngine {
                                 buf = buf[pos + 2..].to_string();
                                 for line in msg.lines() {
                                     if let Some(data) = line.strip_prefix("data: ") {
-                                        if let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) {
+                                        if let Ok(ev) =
+                                            serde_json::from_str::<serde_json::Value>(data)
+                                        {
                                             let kind = ev["type"].as_str().unwrap_or("");
-                                            if kind == "ping" { continue; }
+                                            if kind == "ping" {
+                                                continue;
+                                            }
                                             log::info!("[SSE] Event: {}", kind);
                                             // Trigger immediate sync if not already running
                                             if !*paused_arc.read().await
@@ -1739,7 +2018,10 @@ impl SyncEngine {
                                                     crate::safe_eval(&win, "__HW_SSE_EVENT__", &ev);
                                                 }
                                                 // Small delay to batch rapid successive events
-                                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(300),
+                                                )
+                                                .await;
                                                 // Wake the poll loop for an immediate sync
                                                 sse_trigger.notify_one();
                                                 sync_flag.store(false, Ordering::SeqCst);
@@ -1777,7 +2059,8 @@ struct FreeCandidate {
     expected_sha: String,
     /// Hash before discarding. False only for an entry that is verified AND
     /// unchanged since (same size and mtime as recorded).
-    #[allow(dead_code)] // every candidate is hashed now; the flag stays for the callers that set it.
+    #[allow(dead_code)]
+    // every candidate is hashed now; the flag stays for the callers that set it.
     needs_hash: bool,
     /// Index entry to record once freed, for a server match the index did not
     /// have yet. None for files already in the index.
@@ -1799,7 +2082,12 @@ async fn reconcile_from_server(
     root: &Path,
     index: &HashMap<String, SyncEntry>,
 ) -> Result<(Vec<SyncEntry>, Vec<FreeCandidate>), String> {
-    let token = engine.token.read().await.clone().ok_or_else(|| "not signed in".to_string())?;
+    let token = engine
+        .token
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "not signed in".to_string())?;
     let workspaces = crate::api::list_workspaces(&token).await?;
     let mut trusted = Vec::new();
     let mut to_hash = Vec::new();
@@ -1830,7 +2118,10 @@ async fn reconcile_from_server(
             }
 
             // Already known and usable.
-            if index.get(&rel_path).is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some()) {
+            if index
+                .get(&rel_path)
+                .is_some_and(|e| e.remote_id.is_some() && e.workspace_id.is_some())
+            {
                 continue;
             }
 
@@ -1852,7 +2143,10 @@ async fn reconcile_from_server(
             let entry = SyncEntry {
                 rel_path: rel_path.clone(),
                 sha256: remote_sha.to_string(),
-                modified: rf.updated_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                modified: rf
+                    .updated_at
+                    .clone()
+                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 size,
                 remote_id: Some(rf.id.clone()),
                 workspace_id: Some(ws.id.clone()),
@@ -1860,7 +2154,13 @@ async fn reconcile_from_server(
                 verified: false,
             };
 
-            if trust_without_hash(size, mtime, rf.size, Some(remote_sha), rf.created_at.as_deref()) {
+            if trust_without_hash(
+                size,
+                mtime,
+                rf.size,
+                Some(remote_sha),
+                rf.created_at.as_deref(),
+            ) {
                 trusted.push(entry);
             } else {
                 to_hash.push(FreeCandidate {
@@ -1871,7 +2171,10 @@ async fn reconcile_from_server(
                     expected_sha: remote_sha.to_string(),
                     needs_hash: true,
                     // Recorded only after the hash proves it, and then as verified.
-                    new_entry: Some(SyncEntry { verified: true, ..entry }),
+                    new_entry: Some(SyncEntry {
+                        verified: true,
+                        ..entry
+                    }),
                 });
             }
         }
@@ -1911,7 +2214,11 @@ pub struct FolderOverview {
 
 /// Walk the sync root once: a placeholder counts as online only (its size is
 /// what Explorer shows), every other file as here.
-fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<&[String]>) -> FolderOverview {
+fn build_overview(
+    root: &Path,
+    modes: &HashMap<String, pins::Mode>,
+    own: Option<&[String]>,
+) -> FolderOverview {
     fn skip(name: &str) -> bool {
         name.starts_with('.') || crate::rules::is_excluded(name)
     }
@@ -1926,7 +2233,9 @@ fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<
         }
     }
     fn walk(dir: &Path, files: &mut u64, here: &mut u64, online: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if skip(&e.file_name().to_string_lossy()) {
@@ -1950,11 +2259,20 @@ fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<
         bytes_online: 0,
     };
     let mut out = FolderOverview::default();
-    let Ok(workspaces) = std::fs::read_dir(root) else { return out };
-    let mut ws_dirs: Vec<PathBuf> = workspaces.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let Ok(workspaces) = std::fs::read_dir(root) else {
+        return out;
+    };
+    let mut ws_dirs: Vec<PathBuf> = workspaces
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
     ws_dirs.sort();
     for ws in ws_dirs {
-        let ws_name = ws.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let ws_name = ws
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         if ws_name.starts_with('.') || own.is_some_and(|o| !o.contains(&ws_name)) {
             continue;
         }
@@ -1963,7 +2281,10 @@ fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<
         // doubled the work, and a sync folder can hold hundreds of GB.
         let mut ws_row = row(ws_name.clone(), ws_name.clone(), 0);
         let mut subs: Vec<PathBuf> = Vec::new();
-        for e in std::fs::read_dir(&ws).map(|r| r.flatten().collect::<Vec<_>>()).unwrap_or_default() {
+        for e in std::fs::read_dir(&ws)
+            .map(|r| r.flatten().collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
             let p = e.path();
             if skip(&e.file_name().to_string_lossy()) {
                 continue;
@@ -1971,13 +2292,21 @@ fn build_overview(root: &Path, modes: &HashMap<String, pins::Mode>, own: Option<
             if p.is_dir() {
                 subs.push(p);
             } else {
-                count(&p, &mut ws_row.files, &mut ws_row.bytes_here, &mut ws_row.bytes_online);
+                count(
+                    &p,
+                    &mut ws_row.files,
+                    &mut ws_row.bytes_here,
+                    &mut ws_row.bytes_online,
+                );
             }
         }
         subs.sort();
         let mut sub_rows = Vec::with_capacity(subs.len());
         for sub in subs {
-            let name = sub.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = sub
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             let mut r = row(format!("{ws_name}/{name}"), name, 1);
             walk(&sub, &mut r.files, &mut r.bytes_here, &mut r.bytes_online);
             ws_row.files += r.files;
@@ -1998,7 +2327,9 @@ fn hydrate_tree(dir: &Path) -> (u32, u32) {
     let (mut done, mut failed) = (0u32, 0u32);
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -2019,25 +2350,52 @@ fn hydrate_tree(dir: &Path) -> (u32, u32) {
 
 /// Copies of files dragged out of the window that were not in the sync folder.
 fn drag_cache_path(file_id: &str, name: &str) -> PathBuf {
-    let safe_id: String = file_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let safe_name: String = name.chars().map(|c| if "\\/:*?\"<>|".contains(c) || c.is_control() { '_' } else { c }).collect();
+    let safe_id: String = file_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if "\\/:*?\"<>|".contains(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
     dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("hardwave")
         .join("drag")
         .join(safe_id)
-        .join(if safe_name.trim().is_empty() { "sound".to_string() } else { safe_name })
+        .join(if safe_name.trim().is_empty() {
+            "sound".to_string()
+        } else {
+            safe_name
+        })
 }
 
 /// Stream one file from Workspace to `path`, hashing on the way.
-async fn stream_to_file(token: &str, ws_id: &str, file_id: &str, path: &Path) -> Result<(String, u64), String> {
+async fn stream_to_file(
+    token: &str,
+    ws_id: &str,
+    file_id: &str,
+    path: &Path,
+) -> Result<(String, u64), String> {
     use tokio::io::AsyncWriteExt;
     let url = api::get_download_url(token, ws_id, file_id).await?;
-    let res = api::http_client().get(&url).send().await.map_err(|e| format!("Download failed: {}", e))?;
+    let res = api::http_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
     if !res.status().is_success() {
         return Err(format!("Download failed: {}", res.status()));
     }
-    let mut file = tokio::fs::File::create(path).await.map_err(|e| format!("Write failed: {}", e))?;
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| format!("Write failed: {}", e))?;
     let mut hasher = Sha256::new();
     let mut size = 0u64;
     let mut body = res.bytes_stream();
@@ -2045,10 +2403,16 @@ async fn stream_to_file(token: &str, ws_id: &str, file_id: &str, path: &Path) ->
         let chunk = chunk.map_err(|e| format!("Read body failed: {}", e))?;
         hasher.update(&chunk);
         size += chunk.len() as u64;
-        file.write_all(&chunk).await.map_err(|e| format!("Write failed: {}", e))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("Write failed: {}", e))?;
     }
-    file.flush().await.map_err(|e| format!("Write failed: {}", e))?;
-    file.sync_all().await.map_err(|e| format!("Write failed: {}", e))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Write failed: {}", e))?;
+    file.sync_all()
+        .await
+        .map_err(|e| format!("Write failed: {}", e))?;
     Ok((hex::encode(hasher.finalize()), size))
 }
 
@@ -2097,7 +2461,10 @@ const FREE_SPACE_PARALLEL: usize = 4;
 ///
 /// Hashing happens here, per file, right before freeing it, several files at a
 /// time, instead of up front in the sync pass.
-pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>) -> Result<(u32, u64), String> {
+pub async fn free_up_space(
+    engine: Option<Arc<SyncEngine>>,
+    scope: Option<&str>,
+) -> Result<(u32, u64), String> {
     use futures_util::stream::{self, StreamExt};
 
     if !crate::cloudfiles::is_supported() {
@@ -2151,7 +2518,9 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>)
                 candidates.extend(to_hash);
             }
             // Only ever adds candidates; the index alone is still usable.
-            Err(e) => log::warn!("[FreeSpace] could not reach the server ({e}); using the local index only"),
+            Err(e) => log::warn!(
+                "[FreeSpace] could not reach the server ({e}); using the local index only"
+            ),
         }
     }
 
@@ -2201,25 +2570,25 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>)
         .map(|c| {
             let root = root.clone();
             async move {
-            let path = c.path.clone();
-            let expected = c.expected_sha.clone();
-            let identity = c.identity.clone();
-            let rel_path = c.rel_path.clone();
-            let size = c.size;
-            let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-                // Always hash, never trust the index alone. Freeing an ordinary file deletes the
-                // only local copy before the placeholder takes its place, so the server copy has
-                // to be proven identical first, not merely recorded as uploaded.
-                match hash_file(&path) {
-                    Ok(h) if h == expected => {}
-                    _ => return Ok(false),
-                }
-                crate::cloudfiles::replace_with_placeholder(&root, &rel_path, size, &identity)
-                    .map(|()| true)
-            })
-            .await
-            .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
-            (c, outcome)
+                let path = c.path.clone();
+                let expected = c.expected_sha.clone();
+                let identity = c.identity.clone();
+                let rel_path = c.rel_path.clone();
+                let size = c.size;
+                let outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                    // Always hash, never trust the index alone. Freeing an ordinary file deletes the
+                    // only local copy before the placeholder takes its place, so the server copy has
+                    // to be proven identical first, not merely recorded as uploaded.
+                    match hash_file(&path) {
+                        Ok(h) if h == expected => {}
+                        _ => return Ok(false),
+                    }
+                    crate::cloudfiles::replace_with_placeholder(&root, &rel_path, size, &identity)
+                        .map(|()| true)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("free-space task failed: {e}")));
+                (c, outcome)
             }
         })
         .buffer_unordered(FREE_SPACE_PARALLEL)
@@ -2269,7 +2638,9 @@ pub async fn free_up_space(engine: Option<Arc<SyncEngine>>, scope: Option<&str>)
         }
     }
 
-    log::info!("[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}");
+    log::info!(
+        "[FreeSpace] dehydrated {freed_files} files, {freed_bytes} bytes, skipped {skipped}"
+    );
     Ok((freed_files, freed_bytes))
 }
 
@@ -2335,7 +2706,11 @@ pub async fn archive_folder(
 
     // Where the files land inside that workspace. Defaults to a folder named
     // after the one being moved.
-    let base = match dest_folder.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+    let base = match dest_folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
         Some(d) => d.trim_matches('/').to_string(),
         None => src
             .file_name()
@@ -2362,7 +2737,11 @@ pub async fn archive_folder(
     // Four matches the existing sync path and keeps memory predictable.
     const PARALLEL: usize = 4;
 
-    let total_bytes: u64 = files.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum();
+    let total_bytes: u64 = files
+        .iter()
+        .filter_map(|p| p.metadata().ok())
+        .map(|m| m.len())
+        .sum();
     let started = std::time::Instant::now();
     let done_files = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let done_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2389,12 +2768,17 @@ pub async fn archive_folder(
                 .and_then(|p| p.strip_prefix(&src).ok())
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
                 .unwrap_or_default();
-            let folder_path = if rel_dir.is_empty() { base.clone() } else { format!("{base}/{rel_dir}") };
+            let folder_path = if rel_dir.is_empty() {
+                base.clone()
+            } else {
+                format!("{base}/{rel_dir}")
+            };
 
             let outcome = async {
                 let sha = hash_file(&path).map_err(|e| format!("unreadable ({e})"))?;
                 // Only Ok once the server has marked the file ready.
-                api::upload_file(&token, &ws_id, &name, size, Some(&folder_path), &sha, &path).await?;
+                api::upload_file(&token, &ws_id, &name, size, Some(&folder_path), &sha, &path)
+                    .await?;
                 Ok::<(), String>(())
             }
             .await;
@@ -2402,7 +2786,11 @@ pub async fn archive_folder(
             let entry = match outcome {
                 Ok(()) => match std::fs::remove_file(&path) {
                     Ok(()) => (true, size, None),
-                    Err(e) => (false, 0, Some(format!("{name}: uploaded but not deleted ({e})"))),
+                    Err(e) => (
+                        false,
+                        0,
+                        Some(format!("{name}: uploaded but not deleted ({e})")),
+                    ),
                 },
                 Err(e) => (false, 0, Some(format!("{name}: {e}"))),
             };
@@ -2443,12 +2831,18 @@ pub async fn archive_folder(
             report.moved += 1;
             report.bytes_freed += bytes;
         } else {
-            if err.as_deref().map(|e| e.contains("uploaded but not deleted")).unwrap_or(false) {
+            if err
+                .as_deref()
+                .map(|e| e.contains("uploaded but not deleted"))
+                .unwrap_or(false)
+            {
                 // Safely stored, just not removed locally. Not a skip.
             } else {
                 report.skipped += 1;
             }
-            if let Some(e) = err { report.errors.push(e.clone()); }
+            if let Some(e) = err {
+                report.errors.push(e.clone());
+            }
         }
     }
     report.seconds = started.elapsed().as_secs();
@@ -2460,7 +2854,10 @@ pub async fn archive_folder(
 
     log::info!(
         "[Archive] {} files moved to '{}', {} bytes freed, {} skipped",
-        report.moved, report.workspace, report.bytes_freed, report.skipped
+        report.moved,
+        report.workspace,
+        report.bytes_freed,
+        report.skipped
     );
     Ok(report)
 }
@@ -2493,7 +2890,9 @@ fn is_hidden(path: &Path) -> bool {
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
@@ -2526,7 +2925,9 @@ fn is_folder_metadata(name: &str) -> bool {
 /// metadata is cleared when it is all that remains; a directory still holding
 /// anything real is left exactly as it is.
 fn prune_empty_dirs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut metadata_files = Vec::new();
     let mut has_real_content = false;
 
@@ -2539,7 +2940,10 @@ fn prune_empty_dirs(dir: &Path) {
                 has_real_content = true;
             }
         } else {
-            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             if is_folder_metadata(&name) {
                 metadata_files.push(p);
             } else {
@@ -2585,7 +2989,10 @@ mod redact_token_tests {
         let out = redact_token(line);
         assert!(out.contains("token=REDACTED"));
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
-        assert!(out.ends_with(')'), "the rest of the message survives: {out}");
+        assert!(
+            out.ends_with(')'),
+            "the rest of the message survives: {out}"
+        );
     }
 
     #[test]

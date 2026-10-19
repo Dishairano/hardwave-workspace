@@ -50,6 +50,12 @@ windows = { version = "0.58", features = [
 ] }
 # Drag a sound from the window straight into FL Studio (Sounds page).
 drag = "2"
+# Answer WebView2's clipboard permission request for our own site, so Share
+# copies its link without a prompt. Must match the versions Tauri 2 ships
+# (wry 0.57 uses webview2-com 0.39 on windows 0.62), or the controller type
+# Tauri hands us is a different type from the one we name.
+webview2-com = "0.39"
+windows-core = "0.62"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
